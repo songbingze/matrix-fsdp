@@ -40,15 +40,15 @@ pip install -e .
   HSDP-style replicate x shard layouts.
 - `optimizer_policy="mixed_muon_adamw"`: enables Muon-aware matrix-owner
   planning for `fully_shard(...)`.
-- `MatrixFSDPOptimizer` and `configure_optimizer(...)`: optimizer lifecycle
-  helpers for AdamW, Muon, and mixed Muon/AdamW training.
+- `configure_optimizer(...)`: optimizer helper for AdamW, SGD, Muon, and mixed
+  Muon/AdamW training.
 - `save_matrix_dcp(...)` and `load_matrix_dcp(...)`: DCP checkpoint helpers for
   MatrixFSDP shard metadata and optimizer state.
 
 ## Documentation
 
-- [Usage Guide](docs/usage.md): dense AdamW, dense Muon/HSDP, block-level
-  sharding, and DeepSeek-style MoE with EP-owned routed experts.
+- [Introduction](docs/usage.md): basic concepts, public APIs, `fully_shard(...)`
+  arguments, DeviceMesh setup, optimizers, and MoE boundaries.
 - [Training Integrations](docs/training_integrations.md): activation
   checkpointing, DCP save/load, full-state debug checkpoints, and resharded
   load.

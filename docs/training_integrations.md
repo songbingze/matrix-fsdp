@@ -28,7 +28,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 
-from matrix_fsdp import MatrixFSDPOptimizer, collect_param_groups, fully_shard
+from matrix_fsdp import configure_optimizer, fully_shard
 
 
 class TransformerBlock(nn.Module):
@@ -50,10 +50,12 @@ apply_activation_checkpointing(
 for block in (module for module in model.modules() if isinstance(module, TransformerBlock)):
     fully_shard(block, mesh=mesh, reshard_after_forward=True)
 
-param_groups = collect_param_groups(model)
-optim = MatrixFSDPOptimizer(
-    torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False),
-    param_groups,
+optim = configure_optimizer(
+    model,
+    "adamw",
+    lr=3e-4,
+    weight_decay=0.01,
+    foreach=False,
     max_unsharded_prefetch_units=1,
 )
 ```
@@ -71,7 +73,7 @@ optim.zero_grad(set_to_none=True)
 
 - Apply activation checkpointing before `fully_shard(...)`, so block classes are
   still visible.
-- Keep checkpoint boundaries and FSDP param-group boundaries aligned when
+- Keep checkpoint boundaries and MatrixFSDP sharding boundaries aligned when
   possible.
 - Prefer `NO_REENTRANT` for new runs.
 - Use the public `fully_shard(...)` path for examples and training scripts.
@@ -85,8 +87,8 @@ sidecars remain loadable as a compatibility fallback.
 
 Main APIs:
 
-- `save_matrix_dcp(model_or_groups, checkpoint_dir, optimizer=...)`
-- `load_matrix_dcp(model_or_groups, checkpoint_dir, optimizer=...)`
+- `save_matrix_dcp(model, checkpoint_dir, optimizer=...)`
+- `load_matrix_dcp(model, checkpoint_dir, optimizer=...)`
 - `load_matrix_dcp_full_state(checkpoint_dir)`
 
 Every rank should call save/load with the same `checkpoint_dir`. Use
@@ -127,10 +129,12 @@ apply_activation_checkpointing(
 for block in (module for module in restored_model.modules() if isinstance(module, TransformerBlock)):
     fully_shard(block, mesh=mesh, reshard_after_forward=True)
 
-restored_param_groups = collect_param_groups(restored_model)
-restored_optim = MatrixFSDPOptimizer(
-    torch.optim.AdamW(restored_model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False),
-    restored_param_groups,
+restored_optim = configure_optimizer(
+    restored_model,
+    "adamw",
+    lr=3e-4,
+    weight_decay=0.01,
+    foreach=False,
 )
 
 load_matrix_dcp(
@@ -147,12 +151,12 @@ After load, continue with the normal training loop.
 Construct the same mixed optimizer on restore:
 
 ```python
-from matrix_fsdp import MatrixFSDPOptimizer, collect_param_groups
+from matrix_fsdp import configure_optimizer
 
 
-param_groups = collect_param_groups(model)
-optim = MatrixFSDPOptimizer.from_shard_hints(
-    param_groups,
+optim = configure_optimizer(
+    model,
+    "mixed_muon_adamw",
     default_matrix_optimizer="muon",
     default_other_optimizer="adamw",
     muon_lr=0.03,
@@ -165,9 +169,9 @@ optim = MatrixFSDPOptimizer.from_shard_hints(
 
 save_matrix_dcp(model, checkpoint_dir, optimizer=optim)
 
-restored_param_groups = collect_param_groups(restored_model)
-restored_optim = MatrixFSDPOptimizer.from_shard_hints(
-    restored_param_groups,
+restored_optim = configure_optimizer(
+    restored_model,
+    "mixed_muon_adamw",
     default_matrix_optimizer="muon",
     default_other_optimizer="adamw",
     muon_lr=0.03,
@@ -178,7 +182,6 @@ restored_optim = MatrixFSDPOptimizer.from_shard_hints(
     lazy_muon_init=True,
 )
 load_matrix_dcp(restored_model, checkpoint_dir, optimizer=restored_optim)
-restored_optim.validate_local_state_shapes()
 ```
 
 ### Resharded Load

@@ -1,22 +1,12 @@
-# MatrixFSDP Usage Guide
+# Introduction
 
-This guide shows the recommended user-facing paths for dense transformer models
-and DeepSeek-style MoE models. Keep `README.md` as the short entry point; put
-complete examples here.
+MatrixFSDP is an experimental FSDP2-style runtime for PyTorch models that need
+matrix-aware sharding. The public path is intentionally small:
 
-## Setup
-
-Install the package in the training environment:
-
-```bash
-pip install -r requirements.txt
-pip install -e .
-```
-
-MatrixFSDP expects optimizers to be constructed after sharding, so they see the
-local sharded parameter views.
-
-The normal training loop shape is unchanged:
+1. build the model on the target device;
+2. call `fully_shard(...)` on the model or on repeated blocks;
+3. create the optimizer with `configure_optimizer(...)`;
+4. train with the ordinary PyTorch loop.
 
 ```python
 loss = model(input_ids, labels)
@@ -25,142 +15,165 @@ optim.step()
 optim.zero_grad(set_to_none=True)
 ```
 
-## API Map
+Create optimizers after `fully_shard(...)` so they see the sharded parameter
+views.
 
-- `fully_shard(...)` is the public FSDP2-like API.
-- `DataParallelMeshDims` maps a `DeviceMesh` to `dp_shard` and optional
-  `dp_replicate` dimensions.
-- `MatrixFSDPOptimizer` wraps a torch optimizer and owns runtime prefetch,
-  backward finalization, and optimizer state bookkeeping.
-- `configure_optimizer(...)` and `MatrixFSDPOptimizer.from_shard_hints(...)`
-  build the mixed Muon/AdamW path from MatrixFSDP shard hints.
-- `collect_param_groups(model)` returns the live MatrixFSDP parameter groups
-  when you shard multiple modules.
+## Install
 
-## Shared Dense Model
-
-The examples below use this tiny language model shape:
-
-```python
-import torch
-import torch.nn.functional as F
-from torch import nn
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: int = 4):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_ratio * hidden_size),
-            nn.GELU(),
-            nn.Linear(mlp_ratio * hidden_size, hidden_size),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm1(x)
-        h, _ = self.attn(h, h, h, need_weights=False)
-        x = x + h
-        return x + self.mlp(self.norm2(x))
-
-
-class TinyTransformerLM(nn.Module):
-    def __init__(
-        self,
-        *,
-        vocab_size: int = 8192,
-        hidden_size: int = 1024,
-        num_layers: int = 4,
-        num_heads: int = 8,
-    ):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.embed = nn.Embedding(vocab_size, hidden_size)
-        self.blocks = nn.ModuleList(
-            TransformerBlock(hidden_size, num_heads) for _ in range(num_layers)
-        )
-        self.norm = nn.LayerNorm(hidden_size)
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
-
-    def forward(self, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        x = self.embed(input_ids)
-        for block in self.blocks:
-            x = block(x)
-        logits = self.lm_head(self.norm(x))
-        return F.cross_entropy(logits.flatten(0, 1), labels.flatten())
+```bash
+pip install -r requirements.txt
+pip install -e .
 ```
 
-## Dense AdamW
+## Public API
 
-Use this path for standard dense transformer training. It uses a 1D
-`dp_shard` mesh and a regular `torch.optim.AdamW` created after
-`fully_shard(...)`.
+- `fully_shard(...)`: the main FSDP2-like sharding entry point.
+- `DataParallelMeshDims`: selects which `DeviceMesh` dimensions are used for
+  DP shard and optional DP replicate groups.
+- `configure_optimizer(...)`: builds the supported optimizer path from the
+  sharded model. Use this for AdamW, SGD, Muon, and mixed Muon/AdamW.
+- `save_matrix_dcp(...)` and `load_matrix_dcp(...)`: save and load MatrixFSDP
+  sharded checkpoints through PyTorch Distributed Checkpoint.
+
+Regular training scripts should only need these public APIs.
+
+## `fully_shard(...)`
 
 ```python
-import os
+fully_shard(
+    module,
+    *,
+    mesh=None,
+    reshard_after_forward=None,
+    shard_placement_fn=None,
+    mp_policy=MixedPrecisionPolicy(),
+    offload_policy=OffloadPolicy(),
+    ignored_params=None,
+    dp_mesh_dims=None,
+    optimizer_policy=None,
+)
+```
 
+Arguments:
+
+- `module`: the `nn.Module` to manage. You can shard the whole model or call
+  `fully_shard(...)` on repeated blocks.
+- `mesh`: a `torch.distributed.device_mesh.DeviceMesh`. If omitted, MatrixFSDP
+  falls back to the current distributed world as a 1D shard group.
+- `dp_mesh_dims`: a `DataParallelMeshDims` value that maps `mesh` dimensions to
+  MatrixFSDP data parallel roles.
+  `DataParallelMeshDims(shard="dp_shard")` uses one sharding dimension.
+  `DataParallelMeshDims(shard="dp_shard", replicate="dp_replicate")` enables an
+  HSDP-style replicate x shard layout.
+- `reshard_after_forward`: controls whether full parameters are released after
+  forward. `None` follows the FSDP2 root-module default and keeps full
+  parameters for the simple whole-model case. Use `True` when sharding blocks
+  and you want each block to release full parameters after its forward. Integer
+  subgroup resharding is reserved for a future implementation.
+- `shard_placement_fn`: optional advanced callback for assigning per-parameter
+  shard hints. Most users should leave this unset and use `optimizer_policy`.
+  It cannot be combined with `optimizer_policy`.
+- `mp_policy`: a PyTorch FSDP `MixedPrecisionPolicy`. It controls parameter,
+  reduction, and output dtypes for managed parameters.
+- `offload_policy`: a PyTorch FSDP `OffloadPolicy`. The default is no offload;
+  CUDA parameter/gradient/optimizer-state offload is not the default path.
+- `ignored_params`: parameters that MatrixFSDP should leave unmanaged. This is
+  useful when another parallelism stack owns those tensors, such as routed MoE
+  experts handled by EP.
+- `optimizer_policy`: optional layout policy for optimizer-aware sharding.
+  Leave unset for AdamW/SGD-style dense sharding. Use
+  `"mixed_muon_adamw"` for matrix-owner Muon planning with AdamW fallback for
+  non-matrix parameters.
+
+The function returns the same module object, with MatrixFSDP runtime state
+attached.
+
+## DeviceMesh
+
+1D data parallel sharding:
+
+```python
 import torch
-import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
 from matrix_fsdp import DataParallelMeshDims, fully_shard
 
 
-def train_dense_adamw() -> None:
-    dist.init_process_group("nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+world_size = torch.distributed.get_world_size()
+mesh = DeviceMesh("cuda", torch.arange(world_size), mesh_dim_names=("dp_shard",))
 
-    device = torch.device("cuda", local_rank)
-    world_size = dist.get_world_size()
-    mesh = DeviceMesh("cuda", torch.arange(world_size), mesh_dim_names=("dp_shard",))
-
-    torch.manual_seed(0)
-    model = TinyTransformerLM(
-        vocab_size=8192,
-        hidden_size=1024,
-        num_layers=4,
-        num_heads=8,
-    ).to(device=device, dtype=torch.bfloat16)
-    model = fully_shard(
-        model,
-        mesh=mesh,
-        dp_mesh_dims=DataParallelMeshDims(shard="dp_shard"),
-    )
-    optim = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-
-    for step in range(10):
-        input_ids = torch.randint(model.vocab_size, (2, 512), device=device)
-        labels = torch.randint(model.vocab_size, (2, 512), device=device)
-
-        loss = model(input_ids, labels)
-        loss.backward()
-        optim.step()
-        optim.zero_grad(set_to_none=True)
-
-        if dist.get_rank() == 0:
-            print(f"step={step} loss={loss.item():.4f}")
-
-    dist.destroy_process_group()
+model = fully_shard(
+    model,
+    mesh=mesh,
+    dp_mesh_dims=DataParallelMeshDims(shard="dp_shard"),
+)
 ```
 
-Launch:
+HSDP-style replicate x shard layout:
 
-```bash
-torchrun --standalone --nproc_per_node=4 train_dense_adamw.py
+```python
+dp_replicate = 2
+dp_shard = world_size // dp_replicate
+mesh = DeviceMesh(
+    "cuda",
+    torch.arange(world_size).reshape(dp_replicate, dp_shard),
+    mesh_dim_names=("dp_replicate", "dp_shard"),
+)
+
+model = fully_shard(
+    model,
+    mesh=mesh,
+    dp_mesh_dims=DataParallelMeshDims(shard="dp_shard", replicate="dp_replicate"),
+)
 ```
 
-## Dense Muon + AdamW Tail
+## Optimizers
 
-This path uses matrix-owner planning for 2D parameters. Muon updates whole local
-owner matrices; non-2D parameters and AdamW-tail matrix shards use AdamW.
+Use `configure_optimizer(...)` after sharding.
 
-The example uses a 2D mesh:
+AdamW:
 
-- `dp_replicate`: replicated data-parallel groups;
-- `dp_shard`: the ranks inside each MatrixFSDP shard group.
+```python
+from matrix_fsdp import configure_optimizer
+
+
+optim = configure_optimizer(
+    model,
+    "adamw",
+    lr=3e-4,
+    weight_decay=0.01,
+    foreach=False,
+)
+```
+
+Mixed Muon/AdamW:
+
+```python
+model = fully_shard(
+    model,
+    mesh=mesh,
+    dp_mesh_dims=DataParallelMeshDims(shard="dp_shard", replicate="dp_replicate"),
+    optimizer_policy="mixed_muon_adamw",
+)
+
+optim = configure_optimizer(
+    model,
+    "mixed_muon_adamw",
+    muon_lr=0.03,
+    muon_momentum=0.5,
+    muon_ns_steps=2,
+    muon_weight_decay=0.0,
+    adamw_lr=3e-4,
+    adamw_weight_decay=0.01,
+    adamw_foreach=False,
+    lazy_muon_init=True,
+)
+```
+
+`configure_optimizer(...)` also accepts `"sgd"` and `"muon"` when the PyTorch
+build provides the requested optimizer.
+
+## Minimal AdamW Training
 
 ```python
 import os
@@ -172,120 +185,51 @@ from torch.distributed.device_mesh import DeviceMesh
 from matrix_fsdp import DataParallelMeshDims, configure_optimizer, fully_shard
 
 
-def train_dense_muon_hsdp() -> None:
+def train() -> None:
     dist.init_process_group("nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
     device = torch.device("cuda", local_rank)
     world_size = dist.get_world_size()
-    dp_replicate = 2
-    if world_size % dp_replicate != 0:
-        raise ValueError("world_size must be divisible by dp_replicate.")
-    dp_shard = world_size // dp_replicate
-    mesh = DeviceMesh(
-        "cuda",
-        torch.arange(world_size).reshape(dp_replicate, dp_shard),
-        mesh_dim_names=("dp_replicate", "dp_shard"),
-    )
+    mesh = DeviceMesh("cuda", torch.arange(world_size), mesh_dim_names=("dp_shard",))
 
-    model = TinyTransformerLM(
-        vocab_size=8192,
-        hidden_size=1024,
-        num_layers=4,
-        num_heads=8,
-    ).to(device=device, dtype=torch.bfloat16)
+    model = build_model().to(device=device, dtype=torch.bfloat16)
     model = fully_shard(
         model,
         mesh=mesh,
-        dp_mesh_dims=DataParallelMeshDims(shard="dp_shard", replicate="dp_replicate"),
-        optimizer_policy="mixed_muon_adamw",
+        dp_mesh_dims=DataParallelMeshDims(shard="dp_shard"),
     )
-    optim = configure_optimizer(
-        model,
-        "mixed_muon_adamw",
-        muon_lr=0.03,
-        muon_momentum=0.5,
-        muon_ns_steps=2,
-        muon_weight_decay=0.0,
-        adamw_lr=3e-4,
-        adamw_weight_decay=0.01,
-        adamw_foreach=False,
-        lazy_muon_init=True,
-    )
+    optim = configure_optimizer(model, "adamw", lr=3e-4, weight_decay=0.01)
 
-    for step in range(10):
-        input_ids = torch.randint(model.vocab_size, (2, 512), device=device)
-        labels = torch.randint(model.vocab_size, (2, 512), device=device)
-
+    for _ in range(10):
+        input_ids, labels = next_batch(device)
         loss = model(input_ids, labels)
         loss.backward()
         optim.step()
         optim.zero_grad(set_to_none=True)
 
-        if dist.get_rank() == 0:
-            print(f"step={step} loss={loss.item():.4f}")
-
     dist.destroy_process_group()
 ```
 
-`muon_ns_steps=2` is the repository benchmark setting. The raw
-`torch.optim.Muon` default in current PyTorch builds may differ.
-
-For the custom Muon gather path, enable the native NCCL/sendrecv kernel when it
-is available:
+Launch:
 
 ```bash
-export MATRIX_FSDP_ENABLE_NATIVE_NCCL=1
-export MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL=native_sendrecv
-export MATRIX_FSDP_CUSTOM_REDUCE_SCATTERV_IMPL=uneven_reduce_scatter
+torchrun --standalone --nproc_per_node=4 train.py
 ```
 
-## Block-Level Dense Sharding
+## MoE Boundary
 
-For large transformers, shard each block as its own param group so prefetch and
-backward reduce scheduling have useful boundaries.
+MatrixFSDP does not implement token routing, token dispatch/combine, EP
+all-to-all, expert execution, or attention kernels. Those belong to the upper
+training stack. MatrixFSDP manages only the DP/HSDP parameter set selected by
+the user.
 
-```python
-import torch
-
-from matrix_fsdp import (
-    MatrixFSDPOptimizer,
-    collect_param_groups,
-    fully_shard,
-)
-
-
-model = TinyTransformerLM(...).to(device=device, dtype=torch.bfloat16)
-
-for block in model.blocks:
-    fully_shard(block, mesh=mesh, reshard_after_forward=True)
-
-param_groups = collect_param_groups(model)
-optim = MatrixFSDPOptimizer(
-    torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False),
-    param_groups,
-    max_unsharded_prefetch_units=1,
-)
-```
-
-## DeepSeek-Style MoE
-
-The recommended MoE contract is deliberately narrow:
-
-- upstream EP owns routed expert placement, routing, token dispatch/combine,
-  all-to-all, and expert execution;
-- each rank sees only its EP-local routed expert tensors;
-- MatrixFSDP shards dense/router/shared/norm/MTP parameters;
-- routed local expert parameters are passed through `ignored_params`;
-- eFSDP / EP-local expert FSDP is not part of the default path.
-
-### MoE Helpers
+For DeepSeek-style MoE, let the EP stack own routed experts and pass those
+parameters through `ignored_params`:
 
 ```python
-from torch import nn
-
-def routed_expert_params(module: nn.Module) -> set[nn.Parameter]:
+def routed_expert_params(module):
     return {
         param
         for name, param in module.named_parameters(remove_duplicate=True)
@@ -293,98 +237,18 @@ def routed_expert_params(module: nn.Module) -> set[nn.Parameter]:
     }
 
 
-def non_routed_expert_params(model: nn.Module) -> list[nn.Parameter]:
-    return [
-        param
-        for name, param in model.named_parameters(remove_duplicate=True)
-        if ".local_experts." not in name and ".experts." not in name
-    ]
-```
-
-### Shard Dense Blocks
-
-Call `fully_shard(...)` on each dense block. Routed expert tensors stay outside
-MatrixFSDP through `ignored_params`; all other parameters in the block are
-managed through the public FSDP2-like API.
-
-```python
-import torch
-import torch.distributed as dist
-from torch.distributed.device_mesh import DeviceMesh
-
-from matrix_fsdp import fully_shard
-
-
-world_size = dist.get_world_size()
-mesh = DeviceMesh("cuda", torch.arange(world_size), mesh_dim_names=("dp_shard",))
-dense_fsdp_groups = []
-
 for block in model.layers:
-    ignored = routed_expert_params(block)
     fully_shard(
         block,
         mesh=mesh,
-        ignored_params=ignored,
+        dp_mesh_dims=DataParallelMeshDims(shard="dp_shard"),
+        ignored_params=routed_expert_params(block),
         optimizer_policy="mixed_muon_adamw",
         reshard_after_forward=True,
     )
-    dense_fsdp_groups.append(block._matrix_fsdp_param_group)
+
+optim = configure_optimizer(model, "mixed_muon_adamw", muon_lr=0.03, adamw_lr=3e-4)
 ```
 
-The dense group may include attention, router/gate, norms, shared experts, MTP,
-embeddings, and lm head if those parameters are not owned by another framework
-component. Routed experts stay ignored.
-
-### MoE AdamW
-
-If the EP framework owns routed expert optimizer state, construct the optimizer
-from dense parameters only:
-
-```python
-import torch
-
-from matrix_fsdp import MatrixFSDPOptimizer
-
-
-dense_params = non_routed_expert_params(model)
-optim = MatrixFSDPOptimizer(
-    torch.optim.AdamW(dense_params, lr=3e-4, weight_decay=0.01, foreach=False),
-    dense_fsdp_groups,
-    max_unsharded_prefetch_units=1,
-)
-```
-
-For a single-framework smoke test, including `model.parameters()` is acceptable:
-local experts will remain ordinary local tensors updated by the torch optimizer,
-not FSDP-sharded tensors.
-
-### MoE Muon
-
-Use the dense FSDP groups so only dense 2D matrix-owner parameters enter Muon.
-Non-2D dense tail parameters use AdamW. Routed local experts remain under the EP
-stack.
-
-```python
-from matrix_fsdp import MatrixFSDPOptimizer
-
-
-optim = MatrixFSDPOptimizer.from_shard_hints(
-    dense_fsdp_groups,
-    default_matrix_optimizer="muon",
-    default_other_optimizer="adamw",
-    muon_lr=0.03,
-    muon_momentum=0.5,
-    muon_ns_steps=2,
-    muon_weight_decay=0.0,
-    adamw_lr=3e-4,
-    adamw_weight_decay=0.01,
-    adamw_foreach=False,
-    lazy_muon_init=True,
-    max_unsharded_prefetch_units=1,
-)
-```
-
-### MoE Validation
-
-The ready-to-run CPU/GPU smoke tests and benchmark commands are in
-[MoE Validation Commands](moe_validation_commands.md).
+The routed expert optimizer, EP-local mesh selection, and expert communication
+remain outside MatrixFSDP.
