@@ -14,8 +14,8 @@ The recommended path is the same one used by TorchTitan-style code:
 3. shard the same block boundaries with MatrixFSDP;
 4. construct the optimizer after sharding.
 
-Use `CheckpointImpl.NO_REENTRANT` and set `use_saved_tensor_hooks=False` on the
-MatrixFSDP groups. This is the path covered by the local and CUDA correctness
+Use `CheckpointImpl.NO_REENTRANT` and shard the checkpointed blocks with
+`fully_shard(...)`. This is the path covered by the local and CUDA correctness
 tests.
 
 ```python
@@ -29,7 +29,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 
-from matrix_fsdp import MatrixFSDPOptimizer, module_type_policy, matrix_fully_shard
+from matrix_fsdp import MatrixFSDPOptimizer, collect_param_groups, fully_shard
 
 
 class TransformerBlock(nn.Module):
@@ -48,19 +48,13 @@ apply_activation_checkpointing(
     check_fn=lambda module: isinstance(module, TransformerBlock),
 )
 
-model = matrix_fully_shard(
-    model,
-    mesh=mesh,
-    wrap_policy=module_type_policy(TransformerBlock),
-    reshard_after_forward=True,
-    finalize_after_backward=True,
-    backward_reduce_strategy="bucket_reduce_scatter",
-    use_saved_tensor_hooks=False,
-    use_zero_copy_grad_bucket=False,
-)
+for block in (module for module in model.modules() if isinstance(module, TransformerBlock)):
+    fully_shard(block, mesh=mesh, reshard_after_forward=True)
+
+param_groups = collect_param_groups(model)
 optim = MatrixFSDPOptimizer(
     torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False),
-    model,
+    param_groups,
     max_unsharded_prefetch_units=1,
 )
 ```
@@ -76,13 +70,12 @@ optim.zero_grad(set_to_none=True)
 
 ### Checkpointing Notes
 
-- Apply activation checkpointing before `matrix_fully_shard(...)`, so wrap
-  policies still see the original module structure.
+- Apply activation checkpointing before `fully_shard(...)`, so block classes are
+  still visible.
 - Keep checkpoint boundaries and FSDP param-group boundaries aligned when
   possible.
 - Prefer `NO_REENTRANT` for new runs.
-- Use `use_saved_tensor_hooks=False` when combining MatrixFSDP with activation
-  checkpoint wrappers.
+- Use the public `fully_shard(...)` path for examples and training scripts.
 
 ## torch.compile
 
@@ -107,18 +100,13 @@ apply_activation_checkpointing(
     check_fn=lambda module: isinstance(module, TransformerBlock),
 )
 
-model = matrix_fully_shard(
-    model,
-    mesh=mesh,
-    wrap_policy=module_type_policy(TransformerBlock),
-    reshard_after_forward=True,
-    finalize_after_backward=True,
-    backward_reduce_strategy="bucket_reduce_scatter",
-    use_saved_tensor_hooks=False,
-)
+for block in (module for module in model.modules() if isinstance(module, TransformerBlock)):
+    fully_shard(block, mesh=mesh, reshard_after_forward=True)
+
+param_groups = collect_param_groups(model)
 optim = MatrixFSDPOptimizer(
     torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False),
-    model,
+    param_groups,
 )
 
 compiled_model = torch.compile(model, fullgraph=False)
@@ -137,8 +125,7 @@ construction. Use the compiled wrapper only for forward calls.
 - Do not compile the optimizer or checkpoint save/load calls.
 - If full-model compile is unstable, compile pure compute submodules before
   applying activation checkpointing and sharding.
-- If using `wrap_policy`, apply it to the original module classes before any
-  compile wrapper hides those classes.
+- Shard blocks before any compile wrapper hides the original module classes.
 - Use `fullgraph=False`. MatrixFSDP collectives and lifecycle hooks are expected
   graph-break points.
 - Re-run a small correctness check after changing PyTorch versions, compile
@@ -192,18 +179,13 @@ apply_activation_checkpointing(
     check_fn=lambda module: isinstance(module, TransformerBlock),
 )
 
-restored_model = matrix_fully_shard(
-    restored_model,
-    mesh=mesh,
-    wrap_policy=module_type_policy(TransformerBlock),
-    reshard_after_forward=True,
-    finalize_after_backward=True,
-    backward_reduce_strategy="bucket_reduce_scatter",
-    use_saved_tensor_hooks=False,
-)
+for block in (module for module in restored_model.modules() if isinstance(module, TransformerBlock)):
+    fully_shard(block, mesh=mesh, reshard_after_forward=True)
+
+restored_param_groups = collect_param_groups(restored_model)
 restored_optim = MatrixFSDPOptimizer(
     torch.optim.AdamW(restored_model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False),
-    restored_model,
+    restored_param_groups,
 )
 
 load_matrix_dcp(
@@ -307,7 +289,7 @@ Use this ordering for the most stable setup:
 1. initialize distributed;
 2. build model on the target device;
 3. apply activation checkpointing, if used;
-4. call `fully_shard(...)` or `matrix_fully_shard(...)`;
+4. call `fully_shard(...)`;
 5. construct the optimizer;
 6. optionally create `compiled_model = torch.compile(model, fullgraph=False)`;
 7. train using either `model(...)` or `compiled_model(...)`;

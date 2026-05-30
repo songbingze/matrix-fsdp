@@ -28,8 +28,6 @@ optim.zero_grad(set_to_none=True)
 ## API Map
 
 - `fully_shard(...)` is the public FSDP2-like API.
-- `matrix_fully_shard(...)` is the lower-level API for explicit planners,
-  communication paths, wrap policies, and MoE `ignored_params`.
 - `DataParallelMeshDims` maps a `DeviceMesh` to `dp_shard` and optional
   `dp_replicate` dimensions.
 - `MatrixFSDPOptimizer` wraps a torch optimizer and owns runtime prefetch,
@@ -254,22 +252,15 @@ import torch
 from matrix_fsdp import (
     MatrixFSDPOptimizer,
     collect_param_groups,
-    module_type_policy,
-    matrix_fully_shard,
+    fully_shard,
 )
 
 
 model = TinyTransformerLM(...).to(device=device, dtype=torch.bfloat16)
-model = matrix_fully_shard(
-    model,
-    mesh=mesh,
-    wrap_policy=module_type_policy(TransformerBlock),
-    reshard_after_forward=True,
-    finalize_after_backward=True,
-    backward_reduce_strategy="bucket_reduce_scatter",
-    use_saved_tensor_hooks=False,
-    use_zero_copy_grad_bucket=False,
-)
+
+for block in model.blocks:
+    fully_shard(block, mesh=mesh, reshard_after_forward=True)
+
 param_groups = collect_param_groups(model)
 optim = MatrixFSDPOptimizer(
     torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False),
@@ -294,27 +285,11 @@ The recommended MoE contract is deliberately narrow:
 ```python
 from torch import nn
 
-from matrix_fsdp import build_shard_hints
-
-
 def routed_expert_params(module: nn.Module) -> set[nn.Parameter]:
     return {
         param
         for name, param in module.named_parameters(remove_duplicate=True)
         if ".local_experts." in name or ".experts." in name
-    }
-
-
-def dense_shard_hints(
-    module: nn.Module,
-    ignored_params: set[nn.Parameter],
-) -> dict[str, object]:
-    ignored_ids = {id(param) for param in ignored_params}
-    params_by_name = dict(module.named_parameters(remove_duplicate=True))
-    return {
-        name: hint
-        for name, hint in build_shard_hints(module).items()
-        if id(params_by_name[name]) not in ignored_ids
     }
 
 
@@ -328,37 +303,30 @@ def non_routed_expert_params(model: nn.Module) -> list[nn.Parameter]:
 
 ### Shard Dense Blocks
 
-Use one stateful Muon-aware planner across blocks. This lets owner assignment
-balance cumulatively across the model instead of trying to make every block
-perfectly balanced on its own.
+Call `fully_shard(...)` on each dense block. Routed expert tensors stay outside
+MatrixFSDP through `ignored_params`; all other parameters in the block are
+managed through the public FSDP2-like API.
 
 ```python
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
-from matrix_fsdp import make_muon_shard_aware_group_planner, matrix_fully_shard
+from matrix_fsdp import fully_shard
 
 
 world_size = dist.get_world_size()
 mesh = DeviceMesh("cuda", torch.arange(world_size), mesh_dim_names=("dp_shard",))
-dense_planner = make_muon_shard_aware_group_planner(owner_assignment="role_greedy")
 dense_fsdp_groups = []
 
 for block in model.layers:
     ignored = routed_expert_params(block)
-    matrix_fully_shard(
+    fully_shard(
         block,
         mesh=mesh,
         ignored_params=ignored,
-        shard_hints=dense_shard_hints(block, ignored),
-        auto_shard_hints=False,
-        group_planner=dense_planner,
+        optimizer_policy="mixed_muon_adamw",
         reshard_after_forward=True,
-        finalize_after_backward=True,
-        backward_reduce_strategy="bucket_reduce_scatter",
-        use_saved_tensor_hooks=False,
-        use_zero_copy_grad_bucket=False,
     )
     dense_fsdp_groups.append(block._matrix_fsdp_param_group)
 ```

@@ -54,7 +54,11 @@ class PackageBoundaryTest(unittest.TestCase):
 
         self.assertEqual({path.name for path in docs_dir.glob("*.md")}, usage_docs)
         self.assertIn("MatrixFSDP", (REPO_ROOT / "README.md").read_text())
-        self.assertIn("matrix_fully_shard", (docs_dir / "usage.md").read_text())
+        usage_doc = (docs_dir / "usage.md").read_text()
+        training_doc = (docs_dir / "training_integrations.md").read_text()
+        self.assertIn("fully_shard", usage_doc)
+        self.assertNotIn("matrix_fully_shard", usage_doc)
+        self.assertNotIn("matrix_fully_shard", training_doc)
 
 
 if __name__ == "__main__":

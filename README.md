@@ -23,8 +23,6 @@ pip install -e .
 
 - `fully_shard(model, mesh=..., dp_mesh_dims=...)`: public FSDP2-like entry
   point.
-- `matrix_fully_shard(...)`: lower-level entry point for explicit planners,
-  communication paths, wrap policies, and MoE `ignored_params`.
 - `DataParallelMeshDims(shard="dp_shard")`: selects the `DeviceMesh` dimension
   used for parameter sharding.
 - `DataParallelMeshDims(shard="dp_shard", replicate="dp_replicate")`: enables
