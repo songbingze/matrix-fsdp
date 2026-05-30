@@ -23,6 +23,24 @@ optim.zero_grad(set_to_none=True)
 Create optimizers after sharding so they see the sharded parameter views. For
 most users, `fully_shard(...)` is the only sharding entry point.
 
+## Performance Highlights
+
+Representative 4x A100-PCIE-40GB measurements with PyTorch 2.10, CUDA 12.8,
+BF16 parameters/compute, and transformer-block sharding. The large transformer
+rows use activation checkpointing:
+
+| Case | FSDP2 | MatrixFSDP | Result |
+| --- | ---: | ---: | --- |
+| AdamW, 8L hidden2048 seq1024 | 175.095 ms / 2653.3 MB | 171.491 ms / 2328.7 MB | 2.1% faster, 12.2% lower peak memory |
+| AdamW, 32L hidden4096 seq16384 | 8844.463 ms / 17267.4 MB | 8549.254 ms / 17267.4 MB | 3.3% lower step time at equal peak memory |
+| Muon, 32L hidden4096 seq4096 | 10432.683 ms / 11057.9 MB | 4223.246 ms / 11443.0 MB | 2.47x faster total step |
+| Muon, 40L hidden5120 seq4096 | 20073.158 ms / 20640.7 MB | 8404.598 ms / 21240.3 MB | 2.39x faster total step |
+
+The Muon rows use the same model shape, BF16 compute, block boundaries, and
+activation checkpointing on both sides. MatrixFSDP's advantage there comes from
+matrix-owner sharding, which avoids the expensive full-matrix optimizer gather
+path.
+
 ## Install
 
 ```bash
