@@ -90,7 +90,6 @@ Main APIs:
 
 - `save_matrix_dcp(model, checkpoint_dir, optimizer=...)`
 - `load_matrix_dcp(model, checkpoint_dir, optimizer=...)`
-- `load_matrix_dcp_full_state(checkpoint_dir)`
 
 Every rank should call save/load with the same `checkpoint_dir`. Use
 `no_dist=True` only for single-process debug or tests.
@@ -202,22 +201,6 @@ load_matrix_dcp(
 
 Use this only when model FQNs and tensor shapes match. Validate the result with a
 short forward/backward step before resuming long training.
-
-### Full-State Debug Checkpoint
-
-For inspection or conversion, save full parameters in addition to local shards:
-
-```python
-from matrix_fsdp import load_matrix_dcp_full_state, save_matrix_dcp
-
-
-save_matrix_dcp(model, checkpoint_dir, full_state=True)
-full_state = load_matrix_dcp_full_state(checkpoint_dir)
-params = full_state["params"]
-```
-
-This is a debug/conversion path, not the memory-efficient training checkpoint
-path.
 
 ### Grad Shards
 
