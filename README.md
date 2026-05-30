@@ -65,7 +65,7 @@ pip install -e .
 
 ## Documentation
 
-- [Introduction](docs/usage.md): basic concepts, public APIs, `fully_shard(...)`
+- [Introduction](docs/introduction.md): basic concepts, public APIs, `fully_shard(...)`
   arguments, DeviceMesh setup, optimizers, and MoE boundaries.
 - [Tutorial](docs/tutorial.md): activation checkpointing, DCP save/load,
   full-state debug checkpoints, and resharded load.
