@@ -50,15 +50,15 @@ class PackageBoundaryTest(unittest.TestCase):
 
     def test_usage_docs_are_present(self):
         docs_dir = REPO_ROOT / "docs"
-        usage_docs = {"usage.md", "training_integrations.md", "moe_validation_commands.md"}
+        usage_docs = {"usage.md", "tutorial.md", "moe_validation_commands.md"}
 
         self.assertEqual({path.name for path in docs_dir.glob("*.md")}, usage_docs)
         self.assertIn("MatrixFSDP", (REPO_ROOT / "README.md").read_text())
         usage_doc = (docs_dir / "usage.md").read_text()
-        training_doc = (docs_dir / "training_integrations.md").read_text()
+        tutorial_doc = (docs_dir / "tutorial.md").read_text()
         self.assertIn("fully_shard", usage_doc)
         self.assertNotIn("matrix_fully_shard", usage_doc)
-        self.assertNotIn("matrix_fully_shard", training_doc)
+        self.assertNotIn("matrix_fully_shard", tutorial_doc)
 
 
 if __name__ == "__main__":

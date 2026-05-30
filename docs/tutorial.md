@@ -1,8 +1,9 @@
-# Training Integrations
+# Tutorial
 
-This guide covers activation checkpointing and MatrixFSDP checkpoint save/load.
-The examples assume the model has already been built on the target device and
-that `torch.distributed` has been initialized when running multi-rank training.
+This tutorial covers activation checkpointing and MatrixFSDP checkpoint
+save/load. The examples assume the model has already been built on the target
+device and that `torch.distributed` has been initialized when running multi-rank
+training.
 
 ## Activation Checkpointing
 

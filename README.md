@@ -67,6 +67,5 @@ pip install -e .
 
 - [Introduction](docs/usage.md): basic concepts, public APIs, `fully_shard(...)`
   arguments, DeviceMesh setup, optimizers, and MoE boundaries.
-- [Training Integrations](docs/training_integrations.md): activation
-  checkpointing, DCP save/load, full-state debug checkpoints, and resharded
-  load.
+- [Tutorial](docs/tutorial.md): activation checkpointing, DCP save/load,
+  full-state debug checkpoints, and resharded load.
