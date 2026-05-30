@@ -333,13 +333,15 @@ class MixedMuonAdamWOptimizer:
         adamw_params: Iterable[nn.Parameter],
         *,
         group_summaries: Iterable[MatrixOptimizerParamGroupSummary] = (),
-        muon_lr: float = 0.03,
-        adamw_lr: float = 0.001,
+        lr: float = 0.001,
+        weight_decay: float = 0.01,
+        muon_lr: float | None = None,
+        adamw_lr: float | None = None,
         adamw_betas: tuple[float, float] = (0.9, 0.999),
         adamw_eps: float = 1e-8,
-        adamw_weight_decay: float = 0.01,
+        adamw_weight_decay: float | None = None,
         adamw_foreach: bool | None = None,
-        muon_weight_decay: float = 0.0,
+        muon_weight_decay: float | None = None,
         muon_momentum: float = 0.5,
         muon_ns_steps: int = 2,
         muon_adjust_lr_fn: str | None = DEFAULT_MUON_ADJUST_LR_FN,
@@ -370,14 +372,18 @@ class MixedMuonAdamWOptimizer:
         self.flat_adamw_state = flat_adamw_state
         self.scheduler = None
         self.state_manager = None
+        resolved_muon_lr = lr if muon_lr is None else muon_lr
+        resolved_adamw_lr = lr if adamw_lr is None else adamw_lr
+        resolved_muon_weight_decay = weight_decay if muon_weight_decay is None else muon_weight_decay
+        resolved_adamw_weight_decay = weight_decay if adamw_weight_decay is None else adamw_weight_decay
         if self.muon_params:
             if not hasattr(torch.optim, "Muon"):
                 raise RuntimeError("torch.optim.Muon is not available in this PyTorch build.")
             muon_kwargs = {
-                "lr": muon_lr,
+                "lr": resolved_muon_lr,
                 "momentum": muon_momentum,
                 "ns_steps": muon_ns_steps,
-                "weight_decay": muon_weight_decay,
+                "weight_decay": resolved_muon_weight_decay,
                 "adjust_lr_fn": muon_adjust_lr_fn,
             }
             self.muon = (
@@ -388,10 +394,10 @@ class MixedMuonAdamWOptimizer:
             _remove_prepared_matrix_optimizer(self.muon)
         if self.adamw_params:
             adamw_kwargs = {
-                "lr": adamw_lr,
+                "lr": resolved_adamw_lr,
                 "betas": adamw_betas,
                 "eps": adamw_eps,
-                "weight_decay": adamw_weight_decay,
+                "weight_decay": resolved_adamw_weight_decay,
             }
             if adamw_foreach is not None:
                 adamw_kwargs["foreach"] = adamw_foreach

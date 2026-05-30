@@ -280,11 +280,15 @@ class OptimizerStateTest(unittest.TestCase):
             auto_planner_policy="muon_shard_aware",
         )
 
-        optimizer = configure_optimizer(model, "mixed_muon_adamw")
+        optimizer = configure_optimizer(model, "mixed_muon_adamw", lr=0.004, weight_decay=0.07)
 
         self.assertIsInstance(optimizer, MixedMuonAdamWOptimizer)
         self.assertIs(optimizer.matrix_fsdp, optimizer)
         self.assertEqual(optimizer.runtime_param_groups, [model._matrix_fsdp_param_group])
+        self.assertEqual(optimizer.muon.defaults["lr"], 0.004)
+        self.assertEqual(optimizer.adamw.defaults["lr"], 0.004)
+        self.assertEqual(optimizer.muon.defaults["weight_decay"], 0.07)
+        self.assertEqual(optimizer.adamw.defaults["weight_decay"], 0.07)
 
         x = torch.randn(3, 4)
         model(x).sum().backward()
@@ -297,6 +301,31 @@ class OptimizerStateTest(unittest.TestCase):
         self.assertTrue(state["group_summaries"])
         self.assertTrue(optimizer.local_state_summary())
         optimizer.validate_local_state_shapes()
+
+    @unittest.skipUnless(hasattr(torch.optim, "Muon"), "requires torch.optim.Muon")
+    def test_configure_optimizer_mixed_muon_adamw_allows_per_path_overrides(self):
+        model = matrix_fully_shard(
+            nn.Sequential(nn.Linear(4, 8), nn.LayerNorm(8), nn.Linear(8, 2, bias=False)),
+            auto_shard_hints=True,
+            auto_planner_policy="muon_shard_aware",
+        )
+
+        optimizer = configure_optimizer(
+            model,
+            "mixed_muon_adamw",
+            lr=0.004,
+            weight_decay=0.07,
+            muon_lr=0.006,
+            adamw_lr=0.008,
+            muon_weight_decay=0.0,
+            adamw_weight_decay=0.01,
+        )
+
+        self.assertIsInstance(optimizer, MixedMuonAdamWOptimizer)
+        self.assertEqual(optimizer.muon.defaults["lr"], 0.006)
+        self.assertEqual(optimizer.adamw.defaults["lr"], 0.008)
+        self.assertEqual(optimizer.muon.defaults["weight_decay"], 0.0)
+        self.assertEqual(optimizer.adamw.defaults["weight_decay"], 0.01)
 
 
 if __name__ == "__main__":

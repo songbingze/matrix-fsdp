@@ -163,28 +163,29 @@ model = fully_shard(
 optim = configure_optimizer(
     model,
     "mixed_muon_adamw",
-    muon_lr=0.03,
+    lr=3e-4,
+    weight_decay=0.01,
     muon_momentum=0.5,
     muon_ns_steps=2,
-    muon_weight_decay=0.0,
-    adamw_lr=3e-4,
-    adamw_weight_decay=0.01,
     adamw_foreach=False,
     lazy_muon_init=True,
 )
 ```
 
-Muon defaults in the mixed optimizer are:
+The mixed optimizer accepts AdamW-style shared knobs. By default, `lr` is used
+for both Muon matrix parameters and AdamW tail parameters, and `weight_decay` is
+used for both paths. Pass `muon_lr` / `adamw_lr` or `muon_weight_decay` /
+`adamw_weight_decay` only when you want to tune the two paths separately.
 
-- `muon_lr=0.03`
+Muon-specific defaults are:
+
 - `muon_momentum=0.5`
 - `muon_ns_steps=2`
-- `muon_weight_decay=0.0`
 - `muon_adjust_lr_fn="match_rms_adamw"`
 
-The recommended benchmark path also passes `adamw_lr=3e-4`,
-`adamw_weight_decay=0.01`, `adamw_foreach=False`, and `lazy_muon_init=True`
-explicitly, as shown above.
+`match_rms_adamw` follows the Moonshot-style RMS matching rule exposed by
+PyTorch Muon, so the recommended starting point is to reuse the AdamW learning
+rate, weight decay, and schedule.
 
 `configure_optimizer(...)` also accepts `"sgd"` and `"muon"` when the PyTorch
 build provides the requested optimizer.
@@ -263,7 +264,7 @@ for block in model.layers:
         reshard_after_forward=True,
     )
 
-optim = configure_optimizer(model, "mixed_muon_adamw", muon_lr=0.03, adamw_lr=3e-4)
+optim = configure_optimizer(model, "mixed_muon_adamw", lr=3e-4, weight_decay=0.01)
 ```
 
 The routed expert optimizer, EP-local mesh selection, and expert communication
