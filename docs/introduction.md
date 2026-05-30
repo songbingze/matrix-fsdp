@@ -148,6 +148,10 @@ optim = configure_optimizer(
 
 Mixed Muon/AdamW:
 
+`optimizer_policy="mixed_muon_adamw"` controls the MatrixFSDP layout planner. It
+does not create an optimizer by itself. Create the optimizer with
+`configure_optimizer(model, "mixed_muon_adamw", ...)` after sharding.
+
 ```python
 model = fully_shard(
     model,
@@ -169,6 +173,18 @@ optim = configure_optimizer(
     lazy_muon_init=True,
 )
 ```
+
+Muon defaults in the mixed optimizer are:
+
+- `muon_lr=0.03`
+- `muon_momentum=0.5`
+- `muon_ns_steps=2`
+- `muon_weight_decay=0.0`
+- `muon_adjust_lr_fn="match_rms_adamw"`
+
+The recommended benchmark path also passes `adamw_lr=3e-4`,
+`adamw_weight_decay=0.01`, `adamw_foreach=False`, and `lazy_muon_init=True`
+explicitly, as shown above.
 
 `configure_optimizer(...)` also accepts `"sgd"` and `"muon"` when the PyTorch
 build provides the requested optimizer.
