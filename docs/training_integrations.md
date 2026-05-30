@@ -1,9 +1,8 @@
 # Training Integrations
 
-This guide covers activation checkpointing, `torch.compile`, and MatrixFSDP
-checkpoint save/load. The examples assume the model has already been built on
-the target device and that `torch.distributed` has been initialized when running
-multi-rank training.
+This guide covers activation checkpointing and MatrixFSDP checkpoint save/load.
+The examples assume the model has already been built on the target device and
+that `torch.distributed` has been initialized when running multi-rank training.
 
 ## Activation Checkpointing
 
@@ -76,60 +75,6 @@ optim.zero_grad(set_to_none=True)
   possible.
 - Prefer `NO_REENTRANT` for new runs.
 - Use the public `fully_shard(...)` path for examples and training scripts.
-
-## torch.compile
-
-`torch.compile` is usable for small smoke tests, but it is not the primary
-validated performance path yet. MatrixFSDP uses Python hooks, runtime state
-transitions, and distributed collectives, so expect graph breaks. Start with
-`fullgraph=False` and verify numerics before relying on compiled runs.
-
-Recommended top-level pattern:
-
-```python
-model = build_model().to(device=device, dtype=torch.bfloat16)
-
-# Optional: apply activation checkpointing first.
-apply_activation_checkpointing(
-    model,
-    checkpoint_wrapper_fn=partial(
-        checkpoint_wrapper,
-        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-        preserve_rng_state=False,
-    ),
-    check_fn=lambda module: isinstance(module, TransformerBlock),
-)
-
-for block in (module for module in model.modules() if isinstance(module, TransformerBlock)):
-    fully_shard(block, mesh=mesh, reshard_after_forward=True)
-
-param_groups = collect_param_groups(model)
-optim = MatrixFSDPOptimizer(
-    torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01, foreach=False),
-    param_groups,
-)
-
-compiled_model = torch.compile(model, fullgraph=False)
-
-loss = compiled_model(input_ids, labels)
-loss.backward()
-optim.step()
-optim.zero_grad(set_to_none=True)
-```
-
-Keep the original sharded `model` handle for checkpointing and optimizer
-construction. Use the compiled wrapper only for forward calls.
-
-### Compile Notes
-
-- Do not compile the optimizer or checkpoint save/load calls.
-- If full-model compile is unstable, compile pure compute submodules before
-  applying activation checkpointing and sharding.
-- Shard blocks before any compile wrapper hides the original module classes.
-- Use `fullgraph=False`. MatrixFSDP collectives and lifecycle hooks are expected
-  graph-break points.
-- Re-run a small correctness check after changing PyTorch versions, compile
-  backends, activation checkpoint settings, or FSDP boundaries.
 
 ## DCP Checkpoint Save/Load
 
@@ -291,6 +236,5 @@ Use this ordering for the most stable setup:
 3. apply activation checkpointing, if used;
 4. call `fully_shard(...)`;
 5. construct the optimizer;
-6. optionally create `compiled_model = torch.compile(model, fullgraph=False)`;
-7. train using either `model(...)` or `compiled_model(...)`;
-8. save/load DCP through the original sharded `model` and optimizer.
+6. train with the sharded `model`;
+7. save/load DCP through the sharded `model` and optimizer.

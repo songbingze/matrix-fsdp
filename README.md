@@ -39,8 +39,8 @@ pip install -e .
 - [Usage Guide](docs/usage.md): dense AdamW, dense Muon/HSDP, block-level
   sharding, and DeepSeek-style MoE with EP-owned routed experts.
 - [Training Integrations](docs/training_integrations.md): activation
-  checkpointing, `torch.compile`, DCP save/load, full-state debug checkpoints,
-  and resharded load.
+  checkpointing, DCP save/load, full-state debug checkpoints, and resharded
+  load.
 - [MoE Validation Commands](docs/moe_validation_commands.md): CPU closeout,
   shard8/16/32 planner sweeps, CUDA EP smoke, seq8192 compare, and
   cross-optimizer GPU benchmark commands.
