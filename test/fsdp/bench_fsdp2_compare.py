@@ -1292,17 +1292,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _benchmark_worker(rank: int, config: FSDP2CompareConfig) -> None:
-    if config.device == "cuda":
-        torch.cuda.set_device(rank)
-    if config.device == "cpu":
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", _loopback_interface_name())
-    backend = "nccl" if config.device == "cuda" else "gloo"
-    dist.init_process_group(
-        backend=backend,
-        init_method=f"file://{config.init_file}",
-        rank=rank,
-        world_size=config.world_size,
-    )
+    _init_benchmark_process_group(rank, config)
     try:
         device = torch.device("cuda", rank) if config.device == "cuda" else torch.device("cpu")
         mesh = _make_mesh(config)
@@ -1422,17 +1412,7 @@ def _correctness_worker(
     reference_mode: str,
     candidate_mode: str,
 ) -> None:
-    if config.device == "cuda":
-        torch.cuda.set_device(rank)
-    if config.device == "cpu":
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", _loopback_interface_name())
-    backend = "nccl" if config.device == "cuda" else "gloo"
-    dist.init_process_group(
-        backend=backend,
-        init_method=f"file://{config.init_file}",
-        rank=rank,
-        world_size=config.world_size,
-    )
+    _init_benchmark_process_group(rank, config)
     try:
         device = torch.device("cuda", rank) if config.device == "cuda" else torch.device("cpu")
         mesh = _make_mesh(config)
@@ -1494,13 +1474,7 @@ def _correctness_worker(
 
 
 def _memory_trace_worker(rank: int, config: FSDP2CompareConfig) -> None:
-    torch.cuda.set_device(rank)
-    dist.init_process_group(
-        backend="nccl",
-        init_method=f"file://{config.init_file}",
-        rank=rank,
-        world_size=config.world_size,
-    )
+    _init_benchmark_process_group(rank, config)
     try:
         device = torch.device("cuda", rank)
         mesh = _make_mesh(config)
@@ -1526,17 +1500,7 @@ def _memory_trace_worker(rank: int, config: FSDP2CompareConfig) -> None:
 
 
 def _phase_timing_worker(rank: int, config: FSDP2CompareConfig) -> None:
-    if config.device == "cuda":
-        torch.cuda.set_device(rank)
-    if config.device == "cpu":
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", _loopback_interface_name())
-    backend = "nccl" if config.device == "cuda" else "gloo"
-    dist.init_process_group(
-        backend=backend,
-        init_method=f"file://{config.init_file}",
-        rank=rank,
-        world_size=config.world_size,
-    )
+    _init_benchmark_process_group(rank, config)
     try:
         device = torch.device("cuda", rank) if config.device == "cuda" else torch.device("cpu")
         mesh = _make_mesh(config)
@@ -1552,17 +1516,7 @@ def _phase_timing_worker(rank: int, config: FSDP2CompareConfig) -> None:
 
 
 def _runtime_communication_summary_worker(rank: int, config: FSDP2CompareConfig) -> None:
-    if config.device == "cuda":
-        torch.cuda.set_device(rank)
-    if config.device == "cpu":
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", _loopback_interface_name())
-    backend = "nccl" if config.device == "cuda" else "gloo"
-    dist.init_process_group(
-        backend=backend,
-        init_method=f"file://{config.init_file}",
-        rank=rank,
-        world_size=config.world_size,
-    )
+    _init_benchmark_process_group(rank, config)
     try:
         device = torch.device("cuda", rank) if config.device == "cuda" else torch.device("cpu")
         mesh = _make_mesh(config)
@@ -2811,7 +2765,30 @@ def _cleanup_after_mode(device: str) -> None:
     clear_global_full_param_buffer_pool()
     if device == "cuda":
         torch.cuda.empty_cache()
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+        return
     dist.barrier()
+
+
+def _init_benchmark_process_group(rank: int, config: FSDP2CompareConfig) -> None:
+    if config.device == "cuda":
+        torch.cuda.set_device(rank)
+        dist.init_process_group(
+            backend="nccl",
+            init_method=f"file://{config.init_file}",
+            rank=rank,
+            world_size=config.world_size,
+            device_id=torch.device("cuda", rank),
+        )
+        return
+
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", _loopback_interface_name())
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{config.init_file}",
+        rank=rank,
+        world_size=config.world_size,
+    )
 
 
 def _loopback_interface_name() -> str:

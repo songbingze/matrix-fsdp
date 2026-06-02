@@ -285,15 +285,21 @@ def _profile_worker_impl(rank: int, config: RuntimeProfileConfig) -> dict[str, A
     if config.world_size > 1:
         if config.device == "cuda":
             torch.cuda.set_device(rank)
-        if config.device == "cpu":
+            dist.init_process_group(
+                backend="nccl",
+                init_method=f"file://{config.init_file}",
+                rank=rank,
+                world_size=config.world_size,
+                device_id=torch.device("cuda", rank),
+            )
+        else:
             os.environ.setdefault("GLOO_SOCKET_IFNAME", _loopback_interface_name())
-        backend = "nccl" if config.device == "cuda" else "gloo"
-        dist.init_process_group(
-            backend=backend,
-            init_method=f"file://{config.init_file}",
-            rank=rank,
-            world_size=config.world_size,
-        )
+            dist.init_process_group(
+                backend="gloo",
+                init_method=f"file://{config.init_file}",
+                rank=rank,
+                world_size=config.world_size,
+            )
         initialized_process_group = True
     try:
         device = torch.device("cuda", rank) if config.device == "cuda" else torch.device("cpu")

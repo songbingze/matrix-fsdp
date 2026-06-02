@@ -55,12 +55,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if is_experimental_custom_allgatherv_impl(args.impl):
         os.environ.setdefault("MATRIX_FSDP_ENABLE_GIN_KERNELS", "1")
 
-    dist.init_process_group(args.backend)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(args.backend, device_id=torch.device("cuda", local_rank))
     try:
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        local_rank = int(os.environ.get("LOCAL_RANK", rank))
-        torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
         dtype = _dtype(args.dtype)
         shard_sizes = _parse_shard_sizes(args.shard_sizes, world_size)
