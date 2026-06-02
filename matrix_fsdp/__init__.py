@@ -10,6 +10,14 @@ from .planning.auto_planner import (
     make_muon_shard_aware_group_planner,
 )
 from .runtime.buffer_pool import FullParamBufferPool, clear_global_full_param_buffer_pool
+from .runtime.elastic_param_buffer import (
+    ElasticParamBuffer,
+    ElasticParamBufferLayout,
+    ElasticParamBufferWorkspace,
+    ElasticParamBufferWorkspaceLease,
+    ElasticParamBufferWorkspacePlan,
+    rank_segments_are_rank_contiguous_chunks,
+)
 from .checkpoint import (
     get_model_state_dict,
     get_optimizer_state_dict,

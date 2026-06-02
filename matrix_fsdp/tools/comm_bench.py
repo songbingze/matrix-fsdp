@@ -30,6 +30,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--impl",
         choices=(
             "native_sendrecv",
+            "auto",
             "rma_put_signal",
             "gin_device",
             "native_group_broadcast",
@@ -38,7 +39,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "all_reduce",
             "padded_all_gather",
         ),
-        default="native_sendrecv",
+        default=default_custom_allgatherv_impl(),
         help="Allgatherv implementation to benchmark. rma_put_signal/gin_device are experimental.",
     )
     parser.add_argument("--chunk-fast-path", choices=("0", "1"), default="1")

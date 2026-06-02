@@ -8,6 +8,7 @@ import socket
 import tempfile
 import time
 from functools import partial
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 
@@ -32,6 +33,7 @@ from matrix_fsdp import (
     MixedMuonAdamWOptimizer,
     PrefetchProfileResult,
     MatrixFSDPOptimizer,
+    summarize_param_groups,
     clear_global_full_param_buffer_pool,
     fully_shard as matrix_fully_shard_api,
     fsdp2_chunk_plan,
@@ -195,6 +197,37 @@ class FSDP2PhaseTimingRow:
     model: str = "mlp"
     seq_len: int = 128
     prefetch_budget: str = ""
+
+
+@dataclass(frozen=True)
+class MatrixRuntimeCommunicationRow:
+    mode: str
+    model: str
+    unit: str
+    device: str
+    world_size: int
+    optimizer: str
+    dtype: str
+    param_groups: int
+    gather_backend_counts: str
+    resolved_custom_allgatherv_counts: str
+    rank_chunk_fast_paths: int
+    packed_full_order: int
+    max_segment_count: int
+    max_segments_per_rank: int
+    max_padding_waste_ratio: float
+    max_owner_imbalance_ratio: float
+    workspace_preferred_kind_counts: str
+    max_workspace_preferred_numel: int
+    max_workspace_padded_numel: int
+    max_workspace_padding_waste_ratio: float
+    workspace_acquires: int
+    workspace_reuses: int
+    workspace_allocates: int
+    max_workspace_allocated_numel: int
+    min_shard_size: int
+    max_shard_size: int
+    seq_len: int = 128
 
 
 @dataclass(frozen=True)
@@ -553,6 +586,41 @@ def run_phase_timing(config: FSDP2CompareConfig) -> tuple[FSDP2PhaseTimingRow, .
     return tuple(FSDP2PhaseTimingRow(**row) for row in rows)
 
 
+def run_runtime_communication_summary(config: FSDP2CompareConfig) -> tuple[MatrixRuntimeCommunicationRow, ...]:
+    if config.world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {config.world_size}.")
+    _validate_model_config(config)
+    if config.device == "cuda" and torch.cuda.device_count() < config.world_size:
+        raise RuntimeError(
+            f"CUDA runtime summary requires at least {config.world_size} devices, "
+            f"found {torch.cuda.device_count()}."
+        )
+    if _uses_fsdp2(config.modes) and torch_fully_shard is None:
+        raise RuntimeError("torch.distributed.fsdp.fully_shard is not available in this PyTorch build.")
+
+    rows = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for mode_index, mode in enumerate(config.modes):
+            init_file = config.init_file or os.path.join(tmpdir, f"fsdp2_runtime_summary_init_{mode_index}")
+            output_file = (
+                config.output_file
+                if config.output_file and len(config.modes) == 1
+                else os.path.join(tmpdir, f"fsdp2_runtime_summary_rows_{mode_index}.json")
+            )
+            worker_config = FSDP2CompareConfig(
+                **{
+                    **asdict(config),
+                    "modes": (mode,),
+                    "init_file": init_file,
+                    "output_file": output_file,
+                }
+            )
+            mp.spawn(_runtime_communication_summary_worker, args=(worker_config,), nprocs=config.world_size, join=True)
+            with open(output_file, encoding="utf-8") as result_file:
+                rows.extend(json.load(result_file))
+    return tuple(MatrixRuntimeCommunicationRow(**row) for row in rows)
+
+
 def format_compare_table(rows: Sequence[FSDP2CompareRow]) -> str:
     headers = (
         "mode",
@@ -700,6 +768,77 @@ def format_phase_timing_table(rows: Sequence[FSDP2PhaseTimingRow]) -> str:
             f"{row.avg_step_ms:.3f}",
             f"{row.avg_total_ms:.3f}",
             f"{row.peak_memory_mb:.1f}",
+        )
+        for row in rows
+    ]
+    widths = [len(header) for header in headers]
+    for table_row in table_rows:
+        for index, value in enumerate(table_row):
+            widths[index] = max(widths[index], len(value))
+    lines = [_format_table_row(headers, widths), _format_table_row(tuple("-" * width for width in widths), widths)]
+    lines.extend(_format_table_row(table_row, widths) for table_row in table_rows)
+    return "\n".join(lines)
+
+
+def format_runtime_communication_table(rows: Sequence[MatrixRuntimeCommunicationRow]) -> str:
+    headers = (
+        "mode",
+        "model",
+        "unit",
+        "device",
+        "world",
+        "optim",
+        "dtype",
+        "seq",
+        "groups",
+        "gather_backends",
+        "custom_impls",
+        "chunk_fast",
+        "full_order",
+        "max_segments",
+        "max_segments_rank",
+        "pad_waste",
+        "imbalance",
+        "workspace_kind",
+        "workspace_numel",
+        "workspace_padded",
+        "workspace_waste",
+        "workspace_acq",
+        "workspace_reuse",
+        "workspace_alloc",
+        "workspace_alloc_numel",
+        "min_shard",
+        "max_shard",
+    )
+    table_rows = [
+        (
+            row.mode,
+            row.model,
+            row.unit,
+            row.device,
+            str(row.world_size),
+            row.optimizer,
+            row.dtype,
+            str(row.seq_len if _is_transformer_model(row.model) else "-"),
+            str(row.param_groups),
+            row.gather_backend_counts,
+            row.resolved_custom_allgatherv_counts,
+            str(row.rank_chunk_fast_paths),
+            str(row.packed_full_order),
+            str(row.max_segment_count),
+            str(row.max_segments_per_rank),
+            f"{row.max_padding_waste_ratio:.3f}",
+            f"{row.max_owner_imbalance_ratio:.3f}",
+            row.workspace_preferred_kind_counts,
+            str(row.max_workspace_preferred_numel),
+            str(row.max_workspace_padded_numel),
+            f"{row.max_workspace_padding_waste_ratio:.3f}",
+            str(row.workspace_acquires),
+            str(row.workspace_reuses),
+            str(row.workspace_allocates),
+            str(row.max_workspace_allocated_numel),
+            str(row.min_shard_size),
+            str(row.max_shard_size),
         )
         for row in rows
     ]
@@ -1041,6 +1180,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--phase-timing", action="store_true", help="Print synchronized per-phase timing for each mode.")
+    parser.add_argument(
+        "--runtime-summary",
+        action="store_true",
+        help="Print MatrixFSDP communication/layout summary for each benchmark mode.",
+    )
     parser.add_argument("--copyin-bench", action="store_true", help="Benchmark MatrixFSDP grad bucket copy-in only.")
     parser.add_argument("--copyin-layout", choices=("flat", "matrix", "chunk_cat"), default="flat")
     parser.add_argument(
@@ -1133,6 +1277,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.phase_timing:
         rows = run_phase_timing(config)
         print(format_phase_timing_table(rows))
+        if args.runtime_summary:
+            runtime_rows = run_runtime_communication_summary(config)
+            print()
+            print(format_runtime_communication_table(runtime_rows))
+        return 0
+    if args.runtime_summary:
+        rows = run_runtime_communication_summary(config)
+        print(format_runtime_communication_table(rows))
         return 0
     rows = run_compare_benchmark(config)
     print(format_compare_table(rows))
@@ -1399,6 +1551,32 @@ def _phase_timing_worker(rank: int, config: FSDP2CompareConfig) -> None:
         dist.destroy_process_group()
 
 
+def _runtime_communication_summary_worker(rank: int, config: FSDP2CompareConfig) -> None:
+    if config.device == "cuda":
+        torch.cuda.set_device(rank)
+    if config.device == "cpu":
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", _loopback_interface_name())
+    backend = "nccl" if config.device == "cuda" else "gloo"
+    dist.init_process_group(
+        backend=backend,
+        init_method=f"file://{config.init_file}",
+        rank=rank,
+        world_size=config.world_size,
+    )
+    try:
+        device = torch.device("cuda", rank) if config.device == "cuda" else torch.device("cpu")
+        mesh = _make_mesh(config)
+        rows = []
+        for mode in config.modes:
+            rows.append(_runtime_communication_summary_mode(mode, config, mesh, device))
+            _cleanup_after_mode(config.device)
+        if rank == 0:
+            with open(config.output_file, "w", encoding="utf-8") as result_file:
+                json.dump([asdict(row) for row in rows], result_file, indent=2)
+    finally:
+        dist.destroy_process_group()
+
+
 def _benchmark_mode(
     mode: str,
     config: FSDP2CompareConfig,
@@ -1523,6 +1701,75 @@ def _phase_timing_mode(
         model=config.model,
         seq_len=config.seq_len,
         prefetch_budget=prefetch_budget,
+    )
+
+
+def _runtime_communication_summary_mode(
+    mode: str,
+    config: FSDP2CompareConfig,
+    mesh: DeviceMesh,
+    device: torch.device,
+) -> MatrixRuntimeCommunicationRow:
+    torch.manual_seed(0)
+    model = _make_model(config).to(device=device, dtype=_torch_dtype(config))
+    model, _optimizer = _prepare_mode(mode, model, mesh, config)
+    try:
+        summary = summarize_param_groups(model)
+    except ValueError:
+        communication_summary = {
+            "num_param_groups": 0,
+            "gather_backend_counts": {},
+            "resolved_custom_allgatherv_counts": {},
+            "rank_chunk_fast_path_count": 0,
+            "packed_full_order_count": 0,
+            "max_segment_count": 0,
+            "max_segments_per_rank": 0,
+            "max_padding_waste_ratio": 0.0,
+            "max_owner_imbalance_ratio": 0.0,
+            "workspace_preferred_kind_counts": {},
+            "max_workspace_preferred_numel": 0,
+            "max_workspace_padded_rank_chunks_numel": 0,
+            "max_workspace_padding_waste_ratio": 0.0,
+            "workspace_total_acquire_count": 0,
+            "workspace_total_reuse_count": 0,
+            "workspace_total_allocate_count": 0,
+            "max_workspace_allocated_numel": 0,
+            "max_shard_size": 0,
+            "min_shard_size": 0,
+        }
+    else:
+        communication_summary = summary["communication_summary"]
+
+    return MatrixRuntimeCommunicationRow(
+        mode=mode,
+        model=config.model,
+        unit=config.unit,
+        device=config.device,
+        world_size=config.world_size,
+        optimizer=config.optimizer,
+        dtype=config.dtype,
+        param_groups=int(communication_summary["num_param_groups"]),
+        gather_backend_counts=_format_count_mapping(communication_summary["gather_backend_counts"]),
+        resolved_custom_allgatherv_counts=_format_count_mapping(
+            communication_summary["resolved_custom_allgatherv_counts"]
+        ),
+        rank_chunk_fast_paths=int(communication_summary["rank_chunk_fast_path_count"]),
+        packed_full_order=int(communication_summary["packed_full_order_count"]),
+        max_segment_count=int(communication_summary["max_segment_count"]),
+        max_segments_per_rank=int(communication_summary["max_segments_per_rank"]),
+        max_padding_waste_ratio=float(communication_summary["max_padding_waste_ratio"]),
+        max_owner_imbalance_ratio=float(communication_summary["max_owner_imbalance_ratio"]),
+        workspace_preferred_kind_counts=_format_count_mapping(communication_summary["workspace_preferred_kind_counts"]),
+        max_workspace_preferred_numel=int(communication_summary["max_workspace_preferred_numel"]),
+        max_workspace_padded_numel=int(communication_summary["max_workspace_padded_rank_chunks_numel"]),
+        max_workspace_padding_waste_ratio=float(communication_summary["max_workspace_padding_waste_ratio"]),
+        workspace_acquires=int(communication_summary["workspace_total_acquire_count"]),
+        workspace_reuses=int(communication_summary["workspace_total_reuse_count"]),
+        workspace_allocates=int(communication_summary["workspace_total_allocate_count"]),
+        max_workspace_allocated_numel=int(communication_summary["max_workspace_allocated_numel"]),
+        min_shard_size=int(communication_summary["min_shard_size"]),
+        max_shard_size=int(communication_summary["max_shard_size"]),
+        seq_len=config.seq_len,
     )
 
 
@@ -2566,6 +2813,13 @@ def _loopback_interface_name() -> str:
 
 def _uses_fsdp2(modes: Sequence[str]) -> bool:
     return any(mode.startswith("fsdp2") for mode in modes)
+
+
+def _format_count_mapping(counts: Mapping[str, int]) -> str:
+    normalized = Counter({str(key): int(value) for key, value in counts.items() if int(value) != 0})
+    if not normalized:
+        return "-"
+    return ",".join(f"{key}:{normalized[key]}" for key in sorted(normalized))
 
 
 def _format_table_row(values: Sequence[str], widths: Sequence[int]) -> str:

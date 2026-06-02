@@ -4,6 +4,7 @@ from .custom_collectives import (
     custom_reduce_scatterv_owner_rank_chunks_1d_async,
     native_segment_p2p_enabled,
     normalize_matrix_collective_backend,
+    resolve_custom_allgatherv_impl,
 )
 from .native import (
     NativeKernelStatus,
@@ -35,4 +36,5 @@ __all__ = [
     "native_sendrecv_rank_chunks",
     "native_sendrecv_rank_segments",
     "normalize_matrix_collective_backend",
+    "resolve_custom_allgatherv_impl",
 ]

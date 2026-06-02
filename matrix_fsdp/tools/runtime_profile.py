@@ -213,6 +213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "prefetch_profile_guided",
             "matrix_owner_muon",
             "matrix_owner_muon_role_greedy",
+            "matrix_owner_muon_role_greedy_custom_collective",
         ),
         default="prefetch_bucket_copy_in",
     )
@@ -329,7 +330,11 @@ def _prepare_mode(
     mesh: DeviceMesh | None,
     config: RuntimeProfileConfig,
 ) -> tuple[nn.Module, MatrixFSDPOptimizer]:
-    if config.mode in ("matrix_owner_muon", "matrix_owner_muon_role_greedy"):
+    if config.mode in (
+        "matrix_owner_muon",
+        "matrix_owner_muon_role_greedy",
+        "matrix_owner_muon_role_greedy_custom_collective",
+    ):
         return _prepare_matrix_owner_muon(model, mesh, config)
 
     forward_prefetch = config.mode.startswith("prefetch") or config.mode == "zero_copy_grad_bucket"
@@ -382,7 +387,8 @@ def _prepare_matrix_owner_muon(
 ) -> tuple[nn.Module, MatrixFSDPOptimizer]:
     if config.optimizer != "muon":
         raise ValueError("matrix_owner_muon modes require --optimizer muon.")
-    owner_assignment = "role_greedy" if config.mode == "matrix_owner_muon_role_greedy" else "rotate"
+    owner_assignment = "role_greedy" if "role_greedy" in config.mode else "rotate"
+    matrix_collective_backend = "custom" if config.mode.endswith("_custom_collective") else "owner_broadcast"
     sharded_model = matrix_fully_shard(
         model,
         mesh,
@@ -395,6 +401,7 @@ def _prepare_matrix_owner_muon(
         finalize_after_backward=True,
         backward_reduce_strategy="bucket_reduce_scatter",
         use_zero_copy_grad_bucket=True,
+        matrix_collective_backend=matrix_collective_backend,
     )
     optimizer = MatrixFSDPOptimizer(
         _make_optimizer(sharded_model.parameters(), config),
@@ -572,7 +579,7 @@ def _validate_config(config: RuntimeProfileConfig) -> None:
         raise ValueError(f"Unknown dtype: {config.dtype}.")
     if config.model in ("transformer", "transformer_split_qkv") and config.hidden % config.heads != 0:
         raise ValueError(f"hidden={config.hidden} must be divisible by heads={config.heads}.")
-    if config.mode in ("matrix_owner_muon", "matrix_owner_muon_role_greedy") and config.optimizer != "muon":
+    if config.mode.startswith("matrix_owner_muon") and config.optimizer != "muon":
         raise ValueError("matrix_owner_muon modes require --optimizer muon.")
     if config.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA runtime profile requested but CUDA is not available.")

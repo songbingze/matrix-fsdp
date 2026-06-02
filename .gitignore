@@ -15,6 +15,7 @@
 /**/.ruff_cache
 
 # tmp files
+benchmark_results/
 /**/*.pt
 /**/*.pt.*
 /**/*.npy

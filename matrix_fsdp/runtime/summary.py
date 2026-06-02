@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
@@ -19,6 +20,7 @@ def summarize_param_groups(
     param_group_summaries = [_summarize_param_group(param_group) for param_group in param_groups]
     total_numel = sum(param_group_summary["total_numel"] for param_group_summary in param_group_summaries)
     local_numel = sum(param_group_summary["local_numel"] for param_group_summary in param_group_summaries)
+    communication_summary = _aggregate_communication_summaries(param_group_summaries)
     return {
         "num_param_groups": len(param_group_summaries),
         "param_groups": param_group_summaries,
@@ -30,6 +32,7 @@ def summarize_param_groups(
         "rank_total_muon_param_bytes": _sum_rank_resource(param_group_summaries, "rank_muon_param_bytes"),
         "rank_total_adamw_param_bytes": _sum_rank_resource(param_group_summaries, "rank_adamw_param_bytes"),
         "rank_total_optimizer_bytes": _sum_rank_resource(param_group_summaries, "rank_optimizer_bytes"),
+        "communication_summary": communication_summary,
         "units": param_group_summaries,
     }
 
@@ -70,6 +73,7 @@ def summarize_runtime_events(
             )
     events.sort(key=lambda event_summary: event_summary["sequence"])
     schedulers = _summarize_schedulers(param_groups, param_group_index_by_id)
+    param_group_summaries = [_summarize_param_group(param_group) for param_group in param_groups]
     return {
         "num_param_groups": len(param_groups),
         "num_units": len(param_groups),
@@ -77,7 +81,9 @@ def summarize_runtime_events(
         "num_schedulers": len(schedulers),
         "events": events,
         "event_stats": _summarize_event_stats(events),
+        "communication_event_stats": _summarize_communication_event_stats(events),
         "schedulers": schedulers,
+        "communication_summary": _aggregate_communication_summaries(param_group_summaries),
     }
 
 
@@ -106,6 +112,15 @@ def format_param_group_summary(summary: dict[str, Any]) -> str:
             f"local={param_group_summary['local_numel']} "
             f"rank_mem={_format_rank_values(param_group_summary['rank_memory_bytes'])} "
             f"rank_comm={_format_rank_values(param_group_summary['rank_comm_bytes'])} "
+            f"gather={param_group_summary['communication_summary']['effective_param_gather_backend']} "
+            f"custom={param_group_summary['communication_summary']['resolved_custom_allgatherv_impl']} "
+            f"chunk_fast={param_group_summary['communication_summary']['rank_chunk_fast_path']} "
+            f"pad_waste={param_group_summary['communication_summary']['padding_waste_ratio']:.3f} "
+            f"imbalance={param_group_summary['communication_summary']['owner_imbalance_ratio']:.3f} "
+            f"workspace={param_group_summary['communication_summary']['workspace_preferred_kind']} "
+            f"ws_numel={param_group_summary['communication_summary']['workspace_preferred_numel']} "
+            f"ws_alloc={param_group_summary['communication_summary']['workspace_allocate_count']} "
+            f"ws_reuse={param_group_summary['communication_summary']['workspace_reuse_count']} "
             f"state={param_group_summary['lifecycle_state']} "
             f"reshard_after_forward={param_group_summary['reshard_after_forward']} "
             f"forward_prefetch={param_group_summary['forward_prefetch']} "
@@ -147,6 +162,19 @@ def format_runtime_events(summary: dict[str, Any]) -> str:
                 f"peak_mem_mb={profile_result['peak_memory_mb']:.1f}"
             )
     timed_event_stats = [stat for stat in summary.get("event_stats", ()) if stat["duration_count"] > 0]
+    communication_event_stats = [stat for stat in summary.get("communication_event_stats", ()) if stat["duration_count"] > 0]
+    if communication_event_stats:
+        lines.append("  communication_event_stats:")
+        for stat in communication_event_stats:
+            lines.append(
+                "    "
+                f"{stat['category']} "
+                f"count={stat['count']} "
+                f"timed={stat['duration_count']} "
+                f"sum_ms={stat['duration_sum_ms']:.3f} "
+                f"avg_ms={stat['duration_avg_ms']:.3f} "
+                f"max_ms={stat['duration_max_ms']:.3f}"
+            )
     if timed_event_stats:
         lines.append("  event_stats top_by_sum_ms:")
         for stat in sorted(timed_event_stats, key=lambda item: (-item["duration_sum_ms"], item["name"]))[:12]:
@@ -203,6 +231,60 @@ def _summarize_event_stats(events: list[dict[str, Any]]) -> list[dict[str, Any]]
         if stats["duration_count"]:
             stats["duration_avg_ms"] = stats["duration_sum_ms"] / stats["duration_count"]
     return sorted(stats_by_name.values(), key=lambda stats: stats["name"])
+
+
+def _summarize_communication_event_stats(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stats_by_category: dict[str, dict[str, Any]] = {}
+    for event in events:
+        category = _communication_event_category(event["name"])
+        if category is None:
+            continue
+        stats = stats_by_category.setdefault(
+            category,
+            {
+                "category": category,
+                "count": 0,
+                "duration_count": 0,
+                "duration_sum_ms": 0.0,
+                "duration_avg_ms": 0.0,
+                "duration_max_ms": 0.0,
+            },
+        )
+        stats["count"] += 1
+        duration = event["duration_ms"]
+        if duration is None:
+            continue
+        stats["duration_count"] += 1
+        stats["duration_sum_ms"] += float(duration)
+        stats["duration_max_ms"] = max(stats["duration_max_ms"], float(duration))
+    for stats in stats_by_category.values():
+        if stats["duration_count"]:
+            stats["duration_avg_ms"] = stats["duration_sum_ms"] / stats["duration_count"]
+    order = {
+        "all_gather_enqueue": 0,
+        "all_gather_wait": 1,
+        "grad_copy_in": 2,
+        "reduce_scatter_enqueue": 3,
+        "reduce_scatter_wait": 4,
+        "grad_bucket_collect": 5,
+    }
+    return sorted(stats_by_category.values(), key=lambda stats: order.get(stats["category"], 99))
+
+
+def _communication_event_category(name: str) -> str | None:
+    if name == "enqueue_all_gather_full_params":
+        return "all_gather_enqueue"
+    if name.startswith("wait_unshard:"):
+        return "all_gather_wait"
+    if name in ("copy_in_grad_bucket", "copy_in_grad_bucket_for_accumulation"):
+        return "grad_copy_in"
+    if name == "enqueue_reduce_scatter_grad_bucket":
+        return "reduce_scatter_enqueue"
+    if name == "wait_reduce_grad_bucket":
+        return "reduce_scatter_wait"
+    if name in ("collect_grad_bucket", "prepare_grad_bucket_zero_copy"):
+        return "grad_bucket_collect"
+    return None
 
 
 def _summarize_schedulers(
@@ -316,6 +398,83 @@ def _sum_rank_resource(param_group_summaries: list[dict[str, Any]], key: str) ->
     return tuple(totals)
 
 
+def _aggregate_communication_summaries(param_group_summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    communication_summaries = [
+        param_group_summary["communication_summary"]
+        for param_group_summary in param_group_summaries
+        if param_group_summary.get("communication_summary") is not None
+    ]
+    gather_backend_counts = Counter(
+        str(summary.get("effective_param_gather_backend")) for summary in communication_summaries
+    )
+    custom_impl_counts = Counter(
+        str(summary.get("resolved_custom_allgatherv_impl"))
+        for summary in communication_summaries
+        if summary.get("resolved_custom_allgatherv_impl") is not None
+    )
+    workspace_kind_counts = Counter(
+        str(summary.get("workspace_preferred_kind"))
+        for summary in communication_summaries
+        if summary.get("workspace_preferred_kind") is not None
+    )
+    return {
+        "num_param_groups": len(communication_summaries),
+        "gather_backend_counts": dict(sorted(gather_backend_counts.items())),
+        "resolved_custom_allgatherv_counts": dict(sorted(custom_impl_counts.items())),
+        "workspace_preferred_kind_counts": dict(sorted(workspace_kind_counts.items())),
+        "rank_chunk_fast_path_count": sum(
+            1 for summary in communication_summaries if summary.get("rank_chunk_fast_path")
+        ),
+        "packed_full_order_count": sum(
+            1 for summary in communication_summaries if summary.get("packed_rank_shards_are_full_tensor_order")
+        ),
+        "max_segment_count": max((int(summary.get("segment_count", 0)) for summary in communication_summaries), default=0),
+        "max_segments_per_rank": max(
+            (int(summary.get("max_segments_per_rank", 0)) for summary in communication_summaries),
+            default=0,
+        ),
+        "max_padding_waste_ratio": max(
+            (float(summary.get("padding_waste_ratio", 0.0)) for summary in communication_summaries),
+            default=0.0,
+        ),
+        "max_owner_imbalance_ratio": max(
+            (float(summary.get("owner_imbalance_ratio", 0.0)) for summary in communication_summaries),
+            default=0.0,
+        ),
+        "max_shard_size": max((int(summary.get("max_shard_size", 0)) for summary in communication_summaries), default=0),
+        "min_shard_size": min((int(summary.get("min_shard_size", 0)) for summary in communication_summaries), default=0),
+        "max_workspace_preferred_numel": max(
+            (int(summary.get("workspace_preferred_numel", 0)) for summary in communication_summaries),
+            default=0,
+        ),
+        "max_workspace_padded_rank_chunks_numel": max(
+            (int(summary.get("workspace_padded_rank_chunks_numel", 0)) for summary in communication_summaries),
+            default=0,
+        ),
+        "max_workspace_padding_waste_ratio": max(
+            (float(summary.get("workspace_padding_waste_ratio", 0.0)) for summary in communication_summaries),
+            default=0.0,
+        ),
+        "workspace_total_acquire_count": sum(
+            int(summary.get("workspace_acquire_count", 0)) for summary in communication_summaries
+        ),
+        "workspace_total_reuse_count": sum(
+            int(summary.get("workspace_reuse_count", 0)) for summary in communication_summaries
+        ),
+        "workspace_total_allocate_count": sum(
+            int(summary.get("workspace_allocate_count", 0)) for summary in communication_summaries
+        ),
+        "max_workspace_allocated_numel": max(
+            (int(summary.get("workspace_allocated_numel", 0)) for summary in communication_summaries),
+            default=0,
+        ),
+        "max_workspace_in_use_numel": max(
+            (int(summary.get("workspace_in_use_numel", 0)) for summary in communication_summaries),
+            default=0,
+        ),
+    }
+
+
 def _summarize_param_group(param_group: MatrixFSDPParamGroup) -> dict[str, Any]:
     param_fqns = [mp.fqn for mp in param_group.managed_params]
     total_numel = sum(mp.numel for mp in param_group.managed_params)
@@ -352,6 +511,50 @@ def _summarize_param_group(param_group: MatrixFSDPParamGroup) -> dict[str, Any]:
         else None
     )
     planner_report = planner_summary["report"] if planner_summary is not None else None
+    communication_summary = (
+        param_group.flat_buffer.communication_summary()
+        if param_group.flat_buffer is not None
+        else {
+            "param_gather_strategy": None,
+            "matrix_collective_backend": None,
+            "effective_param_gather_backend": None,
+            "owner_segment_collectives": False,
+            "owner_segment_backend": None,
+            "custom_allgatherv_policy": None,
+            "resolved_custom_allgatherv_impl": None,
+            "rank_chunk_fast_path": False,
+            "packed_rank_shards_are_full_tensor_order": False,
+            "segment_count": 0,
+            "max_segments_per_rank": 0,
+            "shard_sizes": (),
+            "max_shard_size": 0,
+            "min_shard_size": 0,
+            "padding_waste_numel": 0,
+            "padding_waste_ratio": 0.0,
+            "owner_imbalance_ratio": 0.0,
+            "workspace_full_param_numel": 0,
+            "workspace_compact_rank_chunks_numel": 0,
+            "workspace_padded_rank_chunks_numel": 0,
+            "workspace_padding_waste_numel": 0,
+            "workspace_padding_waste_ratio": 0.0,
+            "workspace_preferred_kind": None,
+            "workspace_preferred_numel": 0,
+            "workspace_rank_chunk_fast_path": False,
+            "workspace_packed_full_order": False,
+            "workspace_owner_segment_collectives": False,
+            "workspace_native_group_broadcast_capable": False,
+            "workspace_native_sendrecv_chunk_capable": False,
+            "workspace_padded_all_gather_capable": False,
+            "workspace_compact_owner_reduce_scatter_capable": False,
+            "workspace_acquire_count": 0,
+            "workspace_reuse_count": 0,
+            "workspace_allocate_count": 0,
+            "workspace_allocated_tensors": 0,
+            "workspace_in_use_tensors": 0,
+            "workspace_allocated_numel": 0,
+            "workspace_in_use_numel": 0,
+        }
+    )
     return {
         "runtime_param_group_id": param_group.runtime_metadata.runtime_param_group_id,
         "runtime_unit_id": param_group.runtime_metadata.runtime_unit_id,
@@ -400,6 +603,7 @@ def _summarize_param_group(param_group: MatrixFSDPParamGroup) -> dict[str, Any]:
         "runtime_layout_contract": runtime_layout_contract,
         "planner_report": planner_report,
         "planner_resource_estimate": resource_metadata,
+        "communication_summary": communication_summary,
         "planner_rank_units": (
             tuple(planner_layout_contract["rank_units"]) if planner_layout_contract is not None else ()
         ),

@@ -1,4 +1,12 @@
 from matrix_fsdp.runtime.buffer_pool import FullParamBufferPool, clear_global_full_param_buffer_pool
+from matrix_fsdp.runtime.elastic_param_buffer import (
+    ElasticParamBuffer,
+    ElasticParamBufferLayout,
+    ElasticParamBufferWorkspace,
+    ElasticParamBufferWorkspaceLease,
+    ElasticParamBufferWorkspacePlan,
+    rank_segments_are_rank_contiguous_chunks,
+)
 from matrix_fsdp.runtime.param_group import (
     FSDPLifecycleState,
     FSDPRuntimeState,

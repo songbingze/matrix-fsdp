@@ -582,6 +582,33 @@ class FlatBufferTest(unittest.TestCase):
 
         self.assertTrue(flat_buffer._can_owner_broadcast_full_params())
 
+    def test_communication_summary_reports_owner_custom_layout_cost(self):
+        first = nn.Parameter(torch.arange(6, dtype=torch.float32))
+        second = nn.Parameter(torch.arange(10, 14, dtype=torch.float32))
+        managed_params = _managed_params(("first", first), ("second", second))
+        plan = ShardPlan(
+            total_numel=10,
+            shard_sizes=(6, 4),
+            shard_offsets=(0, 6),
+            rank_segments=(
+                (LayoutSegment(0, 6, 0),),
+                (LayoutSegment(6, 10, 0),),
+            ),
+        )
+
+        flat_buffer = MatrixFlatBuffer(managed_params, plan, rank=0, matrix_collective_backend="custom")
+        summary = flat_buffer.communication_summary()
+
+        self.assertEqual(summary["effective_param_gather_backend"], "owner_segment:custom")
+        self.assertEqual(summary["custom_allgatherv_policy"], "auto")
+        self.assertEqual(summary["resolved_custom_allgatherv_impl"], "native_group_broadcast")
+        self.assertTrue(summary["rank_chunk_fast_path"])
+        self.assertTrue(summary["packed_rank_shards_are_full_tensor_order"])
+        self.assertEqual(summary["segment_count"], 2)
+        self.assertEqual(summary["padding_waste_numel"], 2)
+        self.assertAlmostEqual(summary["padding_waste_ratio"], 0.2)
+        self.assertAlmostEqual(summary["owner_imbalance_ratio"], 1.2)
+
     def test_owner_broadcast_fast_path_rejects_split_parameter_layout(self):
         param = nn.Parameter(torch.arange(4, dtype=torch.float32))
         plan = ShardPlan(
@@ -865,6 +892,34 @@ class FlatBufferTest(unittest.TestCase):
             result.handle.wait(),
             torch.tensor([10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 20.0, 21.0, 22.0, 23.0]),
         )
+
+    def test_grad_bucket_copy_in_reuses_elastic_workspace_after_wait(self):
+        weight = nn.Parameter(torch.arange(6, dtype=torch.float32).view(2, 3))
+        bias = nn.Parameter(torch.arange(4, dtype=torch.float32))
+        managed_params = _managed_params(("weight", weight), ("bias", bias))
+        plan = ShardPlan(
+            total_numel=10,
+            shard_sizes=(10,),
+            shard_offsets=(0,),
+        )
+        flat_buffer = MatrixFlatBuffer(managed_params, plan, rank=0)
+
+        for _ in range(2):
+            weight.grad = torch.arange(10, 16, dtype=torch.float32).view(2, 3)
+            bias.grad = torch.arange(20, 24, dtype=torch.float32)
+            bucket = flat_buffer.collect_grad_bucket()
+            result = flat_buffer.start_reduce_grad_bucket_to_local_shard_with_stats(bucket)
+            torch.testing.assert_close(
+                result.handle.wait(),
+                torch.tensor([10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 20.0, 21.0, 22.0, 23.0]),
+            )
+
+        stats = flat_buffer.elastic_param_buffer.workspace.stats()
+
+        self.assertEqual(stats["workspace_acquire_count"], 2)
+        self.assertEqual(stats["workspace_allocate_count"], 1)
+        self.assertEqual(stats["workspace_reuse_count"], 1)
+        self.assertEqual(stats["workspace_in_use_tensors"], 0)
 
     def test_local_grad_shard_is_tracked_and_cleared(self):
         param = nn.Parameter(torch.arange(6, dtype=torch.float32).view(2, 3))

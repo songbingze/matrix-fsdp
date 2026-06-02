@@ -328,8 +328,13 @@ class MatrixFSDPParamGroup:
         is_prefetch = reason.endswith("_prefetch")
         if validate_owner_collective_signature is None:
             validate_owner_collective_signature = not is_prefetch
+        enqueue_start = perf_counter()
         self._unshard_handle = self.flat_buffer.start_all_gather_full_params(
             validate_owner_collective_signature=validate_owner_collective_signature,
+        )
+        self._record_event(
+            "enqueue_all_gather_full_params",
+            duration_ms=(perf_counter() - enqueue_start) * 1000.0,
         )
         self.lifecycle_state = FSDPLifecycleState.UNSHARDED
         self._unshard_inflight = True

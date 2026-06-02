@@ -818,7 +818,10 @@ def _tensor_nbytes(tensor: torch.Tensor | None) -> int:
 
 
 def _runtime_param_group_order_key(unit: MatrixFSDPParamGroup) -> tuple[str, int | str]:
-    runtime_id = str(unit.runtime_metadata.runtime_param_group_id)
+    runtime_metadata = getattr(unit, "runtime_metadata", None)
+    if runtime_metadata is None:
+        return type(unit).__name__, id(unit)
+    runtime_id = str(runtime_metadata.runtime_param_group_id)
     prefix, sep, suffix = runtime_id.rpartition("_")
     if sep and suffix.isdigit():
         return prefix, int(suffix)

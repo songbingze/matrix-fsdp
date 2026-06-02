@@ -175,6 +175,7 @@ class RuntimeProfileToolTest(unittest.TestCase):
         self.assertEqual(payload["config"]["mode"], "prefetch_profile_guided")
         self.assertIn("runtime_summary", payload)
         self.assertIn("event_stats", payload["runtime_summary"])
+        self.assertIn("communication_event_stats", payload["runtime_summary"])
 
 
 if __name__ == "__main__":

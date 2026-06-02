@@ -21,10 +21,13 @@ MatrixCollectiveBackend = Literal["torch", "owner_broadcast", "custom"]
 _MATRIX_COLLECTIVE_BACKENDS = {"torch", "owner_broadcast", "custom"}
 _CUSTOM_ALLGATHERV_IMPL_ENV = "MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL"
 _NATIVE_SENDRECV_CHUNK_FAST_PATH_ENV = "MATRIX_FSDP_NATIVE_SENDRECV_CHUNK_FAST_PATH"
+_AUTO_NATIVE_SENDRECV_CHUNKS_ENV = "MATRIX_FSDP_AUTO_NATIVE_SENDRECV_CHUNKS"
 _ALLOW_NATIVE_SEGMENT_P2P_ENV = "MATRIX_FSDP_ALLOW_NATIVE_SEGMENT_P2P"
 _OWNER_SEGMENT_PREFETCH_ENV = "MATRIX_FSDP_OWNER_SEGMENT_PREFETCH"
-_DEFAULT_CUSTOM_ALLGATHERV_IMPL = "native_group_broadcast"
+_AUTO_CUSTOM_ALLGATHERV_IMPL = "auto"
+_DEFAULT_CUSTOM_ALLGATHERV_IMPL = _AUTO_CUSTOM_ALLGATHERV_IMPL
 _STABLE_CUSTOM_ALLGATHERV_IMPLS = {
+    _AUTO_CUSTOM_ALLGATHERV_IMPL,
     "native_group_broadcast",
     "native_sendrecv",
     "uneven_all_gather",
@@ -76,7 +79,7 @@ def custom_all_gatherv_rank_segments_1d_into_async(
         _copy_local_rank_segments(local_tensor, output_tensor, rank_segments[rank])
         return MatrixCollectiveHandle(lambda: output_tensor)
 
-    impl = custom_allgatherv_impl()
+    impl = resolve_custom_allgatherv_impl(rank_segments)
     if impl == "native_group_broadcast":
         if validate_signature:
             validate_owner_collective_signature(
@@ -501,6 +504,19 @@ def default_custom_allgatherv_impl() -> str:
     return _DEFAULT_CUSTOM_ALLGATHERV_IMPL
 
 
+def resolve_custom_allgatherv_impl(rank_segments: tuple[tuple[LayoutSegment, ...], ...]) -> str:
+    impl = custom_allgatherv_impl()
+    if impl != _AUTO_CUSTOM_ALLGATHERV_IMPL:
+        return impl
+    if (
+        auto_native_sendrecv_chunks_enabled()
+        and native_sendrecv_chunk_fast_path_enabled()
+        and _rank_chunk_shard_sizes(rank_segments) is not None
+    ):
+        return "native_sendrecv"
+    return "native_group_broadcast"
+
+
 def experimental_custom_allgatherv_impls() -> tuple[str, ...]:
     return tuple(sorted(_EXPERIMENTAL_CUSTOM_ALLGATHERV_IMPLS))
 
@@ -520,7 +536,7 @@ def custom_allgatherv_allows_owner_prefetch(value: str | None = None) -> bool:
         raise ValueError(
             f"{_OWNER_SEGMENT_PREFETCH_ENV} must be 'auto', 'on', or 'off', got {policy!r}."
         )
-    return impl == "native_group_broadcast" and native_kernel_available()
+    return impl in {"auto", "native_group_broadcast"} and native_kernel_available()
 
 
 def custom_allgatherv_owner_prefetch_skip_reason(value: str | None = None) -> str | None:
@@ -541,6 +557,11 @@ def custom_reduce_scatterv_impl() -> str:
 def native_sendrecv_chunk_fast_path_enabled() -> bool:
     value = os.environ.get(_NATIVE_SENDRECV_CHUNK_FAST_PATH_ENV, "1").lower()
     return value not in {"0", "false", "no", "off"}
+
+
+def auto_native_sendrecv_chunks_enabled() -> bool:
+    value = os.environ.get(_AUTO_NATIVE_SENDRECV_CHUNKS_ENV, "").lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def native_segment_p2p_enabled() -> bool:
