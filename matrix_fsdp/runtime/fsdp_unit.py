@@ -297,6 +297,7 @@ class MatrixFSDPParamGroup:
             matrix_collective_backend=self.matrix_collective_backend,
             param_dtype=self.param_dtype,
             reduce_dtype=self.reduce_dtype,
+            collective_key=str(self.runtime_metadata.runtime_param_group_id),
         )
         self.flat_buffer.use_local_shards()
         self._record_event("init")
@@ -315,14 +316,25 @@ class MatrixFSDPParamGroup:
         self.start_unshard("explicit")
         self.wait_unshard("explicit")
 
-    def start_unshard(self, reason: str) -> None:
+    def start_unshard(
+        self,
+        reason: str,
+        *,
+        validate_owner_collective_signature: bool | None = None,
+    ) -> bool:
         if self.flat_buffer is None or self.lifecycle_state == FSDPLifecycleState.UNSHARDED:
-            return
+            return False
         self._record_event(f"start_unshard:{reason}")
-        self._unshard_handle = self.flat_buffer.start_all_gather_full_params()
+        is_prefetch = reason.endswith("_prefetch")
+        if validate_owner_collective_signature is None:
+            validate_owner_collective_signature = not is_prefetch
+        self._unshard_handle = self.flat_buffer.start_all_gather_full_params(
+            validate_owner_collective_signature=validate_owner_collective_signature,
+        )
         self.lifecycle_state = FSDPLifecycleState.UNSHARDED
         self._unshard_inflight = True
         self._record_full_param_buffer_snapshot(f"start_unshard:{reason}")
+        return True
 
     def wait_unshard(self, reason: str) -> None:
         if self.flat_buffer is None or self.lifecycle_state != FSDPLifecycleState.UNSHARDED:
@@ -722,19 +734,33 @@ class MatrixFSDPParamGroup:
         if self.flat_buffer is not None:
             self.flat_buffer.set_full_param_buffer_pool(pool)
 
-    def prefetch_forward(self) -> None:
+    def prefetch_forward(self, *, validate_owner_collective_signature: bool = False) -> bool:
         if self.flat_buffer is None or self.lifecycle_state != FSDPLifecycleState.SHARDED:
-            return
+            return False
+        skip_reason = self.flat_buffer.owner_segment_prefetch_skip_reason()
+        if skip_reason is not None:
+            self._record_event(f"forward_prefetch_skipped:{skip_reason}")
+            return False
         self._record_event("forward_prefetch")
         self._forward_prefetched = True
-        self.start_unshard("forward_prefetch")
+        return self.start_unshard(
+            "forward_prefetch",
+            validate_owner_collective_signature=validate_owner_collective_signature,
+        )
 
-    def prefetch_backward(self) -> None:
+    def prefetch_backward(self, *, validate_owner_collective_signature: bool = False) -> bool:
         if self.flat_buffer is None or self.lifecycle_state != FSDPLifecycleState.FORWARD_RESHARDED:
-            return
+            return False
+        skip_reason = self.flat_buffer.owner_segment_prefetch_skip_reason()
+        if skip_reason is not None:
+            self._record_event(f"backward_prefetch_skipped:{skip_reason}")
+            return False
         self._record_event("backward_prefetch")
         self._backward_prefetched = True
-        self.start_unshard("backward_prefetch")
+        return self.start_unshard(
+            "backward_prefetch",
+            validate_owner_collective_signature=validate_owner_collective_signature,
+        )
 
     def _pre_forward(
         self,

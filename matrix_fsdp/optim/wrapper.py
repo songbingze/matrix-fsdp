@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import MethodType
 from typing import Any
@@ -26,6 +27,7 @@ from matrix_fsdp.runtime.unit_collection import collect_param_groups
 DEFAULT_MUON_ADJUST_LR_FN = "match_rms_adamw"
 _ORIGINAL_OPTIMIZER_INIT: Any | None = None
 _MATRIX_OPTIMIZER_AUTO_PREPARE_INSTALLED = False
+_MATRIX_OPTIMIZER_AUTO_PREPARE_SUPPRESS_DEPTH = 0
 _SCHEDULER_KWARG_NAMES = frozenset(
     {
         "max_unsharded_prefetch_units",
@@ -123,6 +125,10 @@ class PreparedMatrixOptimizer:
         self.optimizer = optimizer
         self._fsdp_param_groups = _normalize_param_groups(module_or_units)
         self.flat_adamw_state = flat_adamw_state
+        self._previous_unit_schedulers = {
+            id(param_group): getattr(param_group, "_scheduler", None)
+            for param_group in self._fsdp_param_groups
+        }
         scheduler_kwargs = _resolve_scheduler_kwargs(
             scheduler_config=scheduler_config,
             max_unsharded_prefetch_units=max_unsharded_prefetch_units,
@@ -194,6 +200,9 @@ class PreparedMatrixOptimizer:
         self._step_pre_handle.remove()
         self._step_post_handle.remove()
         self.optimizer.zero_grad = self._original_zero_grad  # type: ignore[method-assign]
+        for param_group in self._fsdp_param_groups:
+            if getattr(param_group, "_scheduler", None) is self.scheduler:
+                param_group.set_scheduler(self._previous_unit_schedulers.get(id(param_group)))
         for attr in (
             "matrix_fsdp",
             "state_manager",
@@ -277,6 +286,8 @@ def install_matrix_optimizer_auto_prepare() -> None:
 
 
 def _auto_prepare_matrix_optimizer(optimizer: Optimizer) -> None:
+    if _MATRIX_OPTIMIZER_AUTO_PREPARE_SUPPRESS_DEPTH > 0:
+        return
     if isinstance(getattr(optimizer, "matrix_fsdp", None), PreparedMatrixOptimizer):
         return
     fsdp_param_groups = _collect_optimizer_matrix_param_groups(optimizer)
@@ -307,6 +318,21 @@ def _remove_prepared_matrix_optimizer(optimizer: Any) -> None:
     prepared = getattr(optimizer, "matrix_fsdp", None)
     if isinstance(prepared, PreparedMatrixOptimizer):
         prepared.remove()
+
+
+@contextmanager
+def _suppress_matrix_optimizer_auto_prepare():
+    global _MATRIX_OPTIMIZER_AUTO_PREPARE_SUPPRESS_DEPTH
+    _MATRIX_OPTIMIZER_AUTO_PREPARE_SUPPRESS_DEPTH += 1
+    try:
+        yield
+    finally:
+        _MATRIX_OPTIMIZER_AUTO_PREPARE_SUPPRESS_DEPTH -= 1
+
+
+def _make_unprepared_torch_optimizer(optimizer_cls: type[Optimizer], params, **kwargs: Any) -> Optimizer:
+    with _suppress_matrix_optimizer_auto_prepare():
+        return optimizer_cls(params, **kwargs)
 
 
 def _prepared_optimizer_zero_grad(optimizer: Optimizer, *args: Any, **kwargs: Any) -> None:
@@ -389,9 +415,8 @@ class MixedMuonAdamWOptimizer:
             self.muon = (
                 _LazyMuonOptimizer(self.muon_params, **muon_kwargs)
                 if lazy_muon_init
-                else torch.optim.Muon(self.muon_params, **muon_kwargs)
+                else _make_unprepared_torch_optimizer(torch.optim.Muon, self.muon_params, **muon_kwargs)
             )
-            _remove_prepared_matrix_optimizer(self.muon)
         if self.adamw_params:
             adamw_kwargs = {
                 "lr": resolved_adamw_lr,
@@ -401,8 +426,7 @@ class MixedMuonAdamWOptimizer:
             }
             if adamw_foreach is not None:
                 adamw_kwargs["foreach"] = adamw_foreach
-            self.adamw = torch.optim.AdamW(self.adamw_params, **adamw_kwargs)
-            _remove_prepared_matrix_optimizer(self.adamw)
+            self.adamw = _make_unprepared_torch_optimizer(torch.optim.AdamW, self.adamw_params, **adamw_kwargs)
         if self.muon is None and self.adamw is None:
             raise RuntimeError("MixedMuonAdamWOptimizer requires at least one non-empty parameter.")
         if self._matrix_lifecycle_enabled:
@@ -643,8 +667,7 @@ class _LazyMuonOptimizer:
 
     def _materialize(self) -> Optimizer:
         if self._optimizer is None:
-            self._optimizer = torch.optim.Muon(self.params, **self.kwargs)
-            _remove_prepared_matrix_optimizer(self._optimizer)
+            self._optimizer = _make_unprepared_torch_optimizer(torch.optim.Muon, self.params, **self.kwargs)
         return self._optimizer
 
 

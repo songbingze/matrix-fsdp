@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -665,6 +666,62 @@ class FlatBufferTest(unittest.TestCase):
 
         self.assertTrue(flat_buffer.grad_bucket_input_is_compact)
         self.assertEqual(flat_buffer.grad_bucket_input.numel(), 4)
+
+    def test_custom_collective_prefetch_skip_is_backend_aware(self):
+        first = nn.Parameter(torch.arange(3, dtype=torch.float32))
+        second = nn.Parameter(torch.arange(10, 11, dtype=torch.float32))
+        managed_params = _managed_params(("first", first), ("second", second))
+        plan = ShardPlan(
+            total_numel=4,
+            shard_sizes=(3, 1),
+            shard_offsets=(0, 3),
+            rank_segments=(
+                (LayoutSegment(0, 3, 0),),
+                (LayoutSegment(3, 4, 0),),
+            ),
+        )
+        flat_buffer = MatrixFlatBuffer(managed_params, plan, rank=0, matrix_collective_backend="custom")
+
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_sendrecv"}):
+            self.assertEqual(
+                flat_buffer.owner_segment_prefetch_skip_reason(),
+                "custom_allgatherv:native_sendrecv",
+            )
+        with mock.patch.dict(
+            "os.environ",
+            {"MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_group_broadcast"},
+        ), mock.patch(
+            "matrix_fsdp.kernels.custom_collectives.native_kernel_available",
+            return_value=False,
+        ):
+            self.assertEqual(
+                flat_buffer.owner_segment_prefetch_skip_reason(),
+                "custom_allgatherv:native_group_broadcast",
+            )
+        with mock.patch.dict(
+            "os.environ",
+            {"MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_group_broadcast"},
+        ), mock.patch(
+            "matrix_fsdp.kernels.custom_collectives.native_kernel_available",
+            return_value=True,
+        ):
+            self.assertIsNone(flat_buffer.owner_segment_prefetch_skip_reason())
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_group_broadcast",
+                "MATRIX_FSDP_OWNER_SEGMENT_PREFETCH": "on",
+            },
+        ):
+            self.assertIsNone(flat_buffer.owner_segment_prefetch_skip_reason())
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_sendrecv",
+                "MATRIX_FSDP_OWNER_SEGMENT_PREFETCH": "on",
+            },
+        ):
+            self.assertIsNone(flat_buffer.owner_segment_prefetch_skip_reason())
 
     def test_flat_buffer_rejects_unknown_matrix_collective_backend(self):
         param = nn.Parameter(torch.arange(4, dtype=torch.float32))

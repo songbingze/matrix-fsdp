@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import os
 from typing import Literal
 
 import torch
+import torch.distributed as dist
 
 from matrix_fsdp.runtime.buffer_pool import FullParamBufferPool
 from matrix_fsdp.runtime.param_group import MatrixFSDPParamGroup
@@ -119,7 +121,7 @@ class MatrixFSDPScheduler:
             raise ValueError("prefetch_policy must be 'static', 'adaptive', or 'profile_guided'.")
         if backward_prefetch_timing not in ("pre_backward", "post_reshard"):
             raise ValueError("backward_prefetch_timing must be 'pre_backward' or 'post_reshard'.")
-        self.units = tuple(units)
+        self.units = tuple(sorted(units, key=_runtime_param_group_order_key))
         self.prefetch_policy = prefetch_policy
         self.backward_prefetch_timing = backward_prefetch_timing
         self.requested_max_unsharded_prefetch_units = max_unsharded_prefetch_units
@@ -171,6 +173,11 @@ class MatrixFSDPScheduler:
         self._post_forward_order: list[MatrixFSDPParamGroup] = []
         self._post_forward_indices_by_unit_id: dict[int, list[int]] = {}
         self._index_by_unit_id = {id(unit): index for index, unit in enumerate(self.units)}
+        self._owner_forward_prefetch_next_index = 1
+        self._owner_backward_prefetch_next_post_forward_index: int | None = None
+        self._owner_ordered_prefetch_issued_since_sync = False
+        self._owner_ordered_prefetch_enabled = self._distributed_unit_order_is_consistent()
+        self._debug_owner_prefetch_unit_order()
         for unit in self.units:
             unit.set_scheduler(self)
             if hasattr(unit, "set_comm_context"):
@@ -210,11 +217,15 @@ class MatrixFSDPScheduler:
         target = self.next_forward_unit(unit)
         if target is None:
             return
-        if not self._has_forward_prefetch_budget():
+        if self._uses_ordered_owner_prefetch(target):
+            self._prefetch_next_forward_owner_ordered(target)
+            return
+        has_budget = self._has_forward_prefetch_budget()
+        if not has_budget:
             self.forward_prefetch_budget_blocked += 1
             return
-        self.forward_prefetch_issued += 1
-        target.prefetch_forward()
+        if target.prefetch_forward():
+            self.forward_prefetch_issued += 1
 
     def on_pre_backward(self, unit: MatrixFSDPParamGroup) -> None:
         if self.backward_prefetch_timing != "pre_backward":
@@ -234,23 +245,106 @@ class MatrixFSDPScheduler:
     def _prefetch_previous_backward_unit(self, unit: MatrixFSDPParamGroup) -> None:
         if not unit.backward_prefetch_enabled:
             return
-        target = self._previous_backward_prefetch_unit_from_post_forward_order(unit, consume=True)
+        entry = self._previous_backward_prefetch_entry_from_post_forward_order(unit, consume=False)
+        target = entry[1] if entry is not None else None
         if target is None:
             target = self.previous_backward_prefetch_unit(unit)
         if target is None:
             return
-        if not self._has_backward_prefetch_budget():
+        if self._uses_ordered_owner_prefetch(target):
+            if self._prefetch_previous_backward_owner_ordered(target, target_post_forward_index=entry[0] if entry else None):
+                if entry is not None:
+                    self._previous_backward_prefetch_entry_from_post_forward_order(unit, consume=True)
+            return
+        if entry is not None:
+            self._previous_backward_prefetch_entry_from_post_forward_order(unit, consume=True)
+        has_budget = self._has_backward_prefetch_budget()
+        has_memory = not (
+            self.backward_prefetch_timing == "pre_backward"
+            and not self._has_full_param_buffer_budget_for_prefetch(target)
+        )
+        if not has_budget:
             self.backward_prefetch_budget_blocked += 1
             return
-        if self.backward_prefetch_timing == "pre_backward" and not self._has_full_param_buffer_budget_for_prefetch(target):
+        if not has_memory:
             self.backward_prefetch_memory_deferred += 1
             self._deferred_backward_prefetch_unit = target
             return
         self._issue_backward_prefetch(target)
 
-    def _issue_backward_prefetch(self, target: MatrixFSDPParamGroup) -> None:
-        self.backward_prefetch_issued += 1
-        target.prefetch_backward()
+    def _uses_ordered_owner_prefetch(self, target: MatrixFSDPParamGroup) -> bool:
+        flat_buffer = getattr(target, "flat_buffer", None)
+        if flat_buffer is None:
+            return False
+        return (
+            self._owner_ordered_prefetch_enabled
+            and
+            getattr(flat_buffer, "matrix_collective_backend", None) == "custom"
+            and bool(flat_buffer.owner_segment_prefetch_order_gate_required())
+        )
+
+    def _prefetch_next_forward_owner_ordered(self, target: MatrixFSDPParamGroup) -> None:
+        if self.max_forward_prefetch_units == 0:
+            self.forward_prefetch_budget_blocked += 1
+            return
+        target_index = self._index_by_unit_id[id(target)]
+        self._debug_owner_prefetch_queue("forward_attempt", target, target_index, self._owner_forward_prefetch_next_index)
+        if target_index != self._owner_forward_prefetch_next_index:
+            self._record_owner_prefetch_queue_skip(target, "forward", target_index, self._owner_forward_prefetch_next_index)
+            return
+        if target.prefetch_forward():
+            self.forward_prefetch_issued += 1
+            self._owner_ordered_prefetch_issued_since_sync = True
+            self._owner_forward_prefetch_next_index += 1
+            self._debug_owner_prefetch_queue("forward_issued", target, target_index, self._owner_forward_prefetch_next_index)
+
+    def _prefetch_previous_backward_owner_ordered(
+        self,
+        target: MatrixFSDPParamGroup,
+        *,
+        target_post_forward_index: int | None,
+    ) -> bool:
+        if self.max_backward_prefetch_units == 0:
+            self.backward_prefetch_budget_blocked += 1
+            return False
+        if self._owner_ordered_prefetch_uses_rank_local_memory_caps():
+            self.backward_prefetch_memory_deferred += 1
+            self._record_owner_prefetch_queue_skip(target, "backward", -1, -1, reason="memory_cap")
+            return False
+        if target_post_forward_index is None:
+            target_order_index = self._index_by_unit_id[id(target)]
+            expected_index = target_order_index
+        else:
+            self._ensure_owner_backward_prefetch_cursor()
+            target_order_index = target_post_forward_index
+            expected_index = self._owner_backward_prefetch_next_post_forward_index
+        self._debug_owner_prefetch_queue("backward_attempt", target, target_order_index, expected_index)
+        if expected_index is None or target_order_index != expected_index:
+            self._record_owner_prefetch_queue_skip(target, "backward", target_order_index, expected_index)
+            return False
+        if not self._issue_backward_prefetch(target):
+            return False
+        self._owner_ordered_prefetch_issued_since_sync = True
+        if target_post_forward_index is not None and self._owner_backward_prefetch_next_post_forward_index is not None:
+            self._owner_backward_prefetch_next_post_forward_index -= 1
+        self._debug_owner_prefetch_queue(
+            "backward_issued",
+            target,
+            target_order_index,
+            self._owner_backward_prefetch_next_post_forward_index,
+        )
+        return True
+
+    def _issue_backward_prefetch(
+        self,
+        target: MatrixFSDPParamGroup,
+        *,
+        validate_owner_collective_signature: bool = False,
+    ) -> bool:
+        if target.prefetch_backward(validate_owner_collective_signature=validate_owner_collective_signature):
+            self.backward_prefetch_issued += 1
+            return True
+        return False
 
     def before_backward_reduce(self, unit: MatrixFSDPParamGroup) -> None:
         self._prune_completed_backward_reduces()
@@ -277,8 +371,10 @@ class MatrixFSDPScheduler:
             return
 
     def finish_backward_iteration(self) -> None:
+        self._synchronize_ordered_owner_prefetch_epoch()
         self._post_forward_order.clear()
         self._post_forward_indices_by_unit_id.clear()
+        self._reset_ordered_prefetch_queues_for_forward()
 
     def wait_pending_backward_reduce(self) -> None:
         self._wait_all_pending_backward_reduces()
@@ -393,6 +489,7 @@ class MatrixFSDPScheduler:
         self.backward_reduce_waits = 0
         self._pending_backward_reduce_units.clear()
         self._deferred_backward_prefetch_unit = None
+        self._reset_ordered_prefetch_queues_for_forward()
         self.full_param_buffer_snapshots.clear()
         self.runtime_memory_snapshots.clear()
         self.max_active_full_param_buffers = 0
@@ -577,6 +674,15 @@ class MatrixFSDPScheduler:
         *,
         consume: bool,
     ) -> MatrixFSDPParamGroup | None:
+        entry = self._previous_backward_prefetch_entry_from_post_forward_order(unit, consume=consume)
+        return entry[1] if entry is not None else None
+
+    def _previous_backward_prefetch_entry_from_post_forward_order(
+        self,
+        unit: MatrixFSDPParamGroup,
+        *,
+        consume: bool,
+    ) -> tuple[int, MatrixFSDPParamGroup] | None:
         indices = self._post_forward_indices_by_unit_id.get(id(unit))
         if not indices:
             return None
@@ -585,7 +691,101 @@ class MatrixFSDPScheduler:
             indices.pop()
         if current_index <= 0:
             return None
-        return self._post_forward_order[current_index - 1]
+        target_index = current_index - 1
+        return target_index, self._post_forward_order[target_index]
+
+    def _reset_ordered_prefetch_queues_for_forward(self) -> None:
+        self._owner_forward_prefetch_next_index = 1
+        self._owner_backward_prefetch_next_post_forward_index = None
+
+    def _ensure_owner_backward_prefetch_cursor(self) -> None:
+        if self._owner_backward_prefetch_next_post_forward_index is None:
+            self._owner_backward_prefetch_next_post_forward_index = len(self._post_forward_order) - 2
+
+    def _owner_ordered_prefetch_uses_rank_local_memory_caps(self) -> bool:
+        return (
+            self.max_active_full_param_buffers_limit is not None
+            or self.max_active_full_param_numel_limit is not None
+            or self.max_active_full_param_bytes_limit is not None
+        )
+
+    def _record_owner_prefetch_queue_skip(
+        self,
+        target: MatrixFSDPParamGroup,
+        phase: str,
+        actual_index: int,
+        expected_index: int | None,
+        *,
+        reason: str = "order",
+    ) -> None:
+        record_event = getattr(target, "_record_event", None)
+        if record_event is None:
+            return
+        record_event(
+            f"{phase}_prefetch_skipped:owner_ordered_queue:{reason}:"
+            f"actual={actual_index}:expected={expected_index}"
+        )
+
+    def _synchronize_ordered_owner_prefetch_epoch(self) -> None:
+        if not self._owner_ordered_prefetch_issued_since_sync:
+            return
+        self._owner_ordered_prefetch_issued_since_sync = False
+        self._barrier_ordered_owner_prefetch_group()
+
+    def _barrier_ordered_owner_prefetch_group(self) -> None:
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        group = self._owner_ordered_prefetch_group()
+        dist.barrier(group=group)
+
+    def _owner_ordered_prefetch_group(self):
+        for unit in self.units:
+            if self._uses_ordered_owner_prefetch(unit):
+                return getattr(unit, "group", None)
+        return None
+
+    def _debug_owner_prefetch_queue(
+        self,
+        event: str,
+        target: MatrixFSDPParamGroup,
+        actual_index: int,
+        expected_index: int | None,
+    ) -> None:
+        if os.environ.get("MATRIX_FSDP_DEBUG_OWNER_PREFETCH_QUEUE", "").lower() not in {"1", "true", "yes", "on"}:
+            return
+        rank = int(getattr(target, "rank", -1))
+        target_id = str(getattr(target.runtime_metadata, "runtime_param_group_id", "unknown"))
+        lifecycle = getattr(getattr(target, "lifecycle_state", None), "value", getattr(target, "lifecycle_state", None))
+        path = f"/tmp/matrix_fsdp_owner_prefetch_rank{rank}.log"
+        with open(path, "a", encoding="utf-8") as log_file:
+            log_file.write(
+                f"{event} target={target_id} actual={actual_index} expected={expected_index} "
+                f"lifecycle={lifecycle} post_forward={len(self._post_forward_order)}\n"
+            )
+
+    def _debug_owner_prefetch_unit_order(self) -> None:
+        if os.environ.get("MATRIX_FSDP_DEBUG_OWNER_PREFETCH_QUEUE", "").lower() not in {"1", "true", "yes", "on"}:
+            return
+        rank = _scheduler_rank(self.units)
+        path = f"/tmp/matrix_fsdp_owner_prefetch_rank{rank}.log"
+        ordered_ids = ",".join(str(unit.runtime_metadata.runtime_param_group_id) for unit in self.units)
+        with open(path, "a", encoding="utf-8") as log_file:
+            log_file.write(
+                f"scheduler_init owner_enabled={self._owner_ordered_prefetch_enabled} units={ordered_ids}\n"
+            )
+
+    def _distributed_unit_order_is_consistent(self) -> bool:
+        if not (dist.is_available() and dist.is_initialized()):
+            return True
+        group = None
+        for unit in self.units:
+            group = getattr(unit, "group", None)
+            if group is not None:
+                break
+        local_order = tuple(str(unit.runtime_metadata.runtime_param_group_id) for unit in self.units)
+        gathered: list[object] = [None for _ in range(dist.get_world_size(group=group))]
+        dist.all_gather_object(gathered, local_order, group=group)
+        return all(order == local_order for order in gathered)
 
     def _create_comm_context(self) -> MatrixFSDPCommContext | None:
         device = self._cuda_device()
@@ -615,6 +815,23 @@ def _tensor_nbytes(tensor: torch.Tensor | None) -> int:
     logical_nbytes = int(tensor.numel() * tensor.element_size())
     storage_nbytes = int(tensor.untyped_storage().nbytes())
     return min(logical_nbytes, storage_nbytes)
+
+
+def _runtime_param_group_order_key(unit: MatrixFSDPParamGroup) -> tuple[str, int | str]:
+    runtime_id = str(unit.runtime_metadata.runtime_param_group_id)
+    prefix, sep, suffix = runtime_id.rpartition("_")
+    if sep and suffix.isdigit():
+        return prefix, int(suffix)
+    return runtime_id, runtime_id
+
+
+def _scheduler_rank(units: Sequence[MatrixFSDPParamGroup]) -> int:
+    for unit in units:
+        try:
+            return int(getattr(unit, "rank"))
+        except (TypeError, ValueError):
+            continue
+    return -1
 
 
 def configure_forward_prefetch(

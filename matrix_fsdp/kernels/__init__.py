@@ -2,6 +2,7 @@ from .custom_collectives import (
     MatrixCollectiveBackend,
     custom_all_gatherv_rank_segments_1d_into_async,
     custom_reduce_scatterv_owner_rank_chunks_1d_async,
+    native_segment_p2p_enabled,
     normalize_matrix_collective_backend,
 )
 from .native import (
@@ -30,6 +31,7 @@ __all__ = [
     "native_kernel_available",
     "native_kernel_status",
     "native_nccl_collectives_enabled",
+    "native_segment_p2p_enabled",
     "native_sendrecv_rank_chunks",
     "native_sendrecv_rank_segments",
     "normalize_matrix_collective_backend",

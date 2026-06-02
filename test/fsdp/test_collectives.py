@@ -13,6 +13,7 @@ from matrix_fsdp.collectives import (
 from matrix_fsdp.runtime.collectives import (
     _make_uneven_all_gather_output_list,
     _make_uneven_reduce_scatter_input_list,
+    validate_owner_collective_signature,
 )
 from matrix_fsdp.layout import LayoutSegment
 
@@ -114,6 +115,39 @@ def _run_two_rank_reduce_scatterv_backend(rank: int, world_size: int, init_file:
         dist.destroy_process_group()
 
 
+def _run_two_rank_owner_signature_mismatch(rank: int, world_size: int, init_file: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        if rank == 0:
+            rank_segments = (
+                (LayoutSegment(0, 2, 0),),
+                (LayoutSegment(2, 5, 0),),
+            )
+        else:
+            rank_segments = (
+                (LayoutSegment(0, 3, 0),),
+                (LayoutSegment(3, 5, 0),),
+            )
+        try:
+            validate_owner_collective_signature(
+                collective_key="mismatch_unit",
+                backend="native_sendrecv_rank_chunks",
+                rank_segments=rank_segments,
+                output_numel=5,
+            )
+        except RuntimeError as exc:
+            assert "owner collective signature mismatch" in str(exc)
+        else:
+            raise AssertionError("Expected owner collective signature mismatch.")
+    finally:
+        dist.destroy_process_group()
+
+
 @unittest.skipUnless(dist.is_available(), "torch.distributed is not available")
 class MatrixCollectiveBackendTest(unittest.TestCase):
     def test_uneven_all_gather_uses_full_buffer_views_for_contiguous_rank_segments(self):
@@ -181,6 +215,17 @@ class MatrixCollectiveBackendTest(unittest.TestCase):
 
     def test_two_rank_cpu_custom_reduce_scatterv_fallback_semantics(self):
         self._run_two_rank_reduce_scatterv_backend("custom")
+
+    def test_two_rank_owner_collective_signature_mismatch_raises(self):
+        world_size = 2
+        with tempfile.TemporaryDirectory() as tmpdir:
+            init_file = os.path.join(tmpdir, "owner_signature_mismatch_init")
+            mp.spawn(
+                _run_two_rank_owner_signature_mismatch,
+                args=(world_size, init_file),
+                nprocs=world_size,
+                join=True,
+            )
 
     def _run_two_rank_allgatherv_backend(self, backend: str) -> None:
         world_size = 2

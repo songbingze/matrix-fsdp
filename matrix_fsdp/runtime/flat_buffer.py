@@ -96,6 +96,7 @@ class MatrixFlatBuffer:
         matrix_collective_backend: str = "owner_broadcast",
         param_dtype: torch.dtype | None = None,
         reduce_dtype: torch.dtype | None = None,
+        collective_key: str | None = None,
     ) -> None:
         self.managed_params = managed_params
         self.plan = plan
@@ -120,6 +121,7 @@ class MatrixFlatBuffer:
         self.param_gather_strategy = param_gather_strategy
         self.matrix_collective_backend = normalize_matrix_collective_backend(matrix_collective_backend)
         self.param_dtype = param_dtype
+        self.collective_key = collective_key
         self._dtensor_spec_cache: dict[tuple[object, tuple[int, ...], tuple[int, ...], torch.dtype], object] = {}
 
         self.matrix_shard_compatibility = explain_matrix_shard_compatibility(plan)
@@ -267,7 +269,11 @@ class MatrixFlatBuffer:
     def all_gather_full_params(self) -> None:
         self.finish_all_gather_full_params(self.start_all_gather_full_params())
 
-    def start_all_gather_full_params(self) -> MatrixCollectiveHandle:
+    def start_all_gather_full_params(
+        self,
+        *,
+        validate_owner_collective_signature: bool = True,
+    ) -> MatrixCollectiveHandle:
         all_gather_input = self._maybe_to_param_dtype(self.local_shard)
         if self.full_buffer is None:
             self.full_buffer = self.full_param_buffer_pool.acquire(
@@ -299,6 +305,8 @@ class MatrixFlatBuffer:
                 backend=self._owner_segment_collective_backend(),
                 group=self.group,
                 cuda_stream=self.cuda_all_gather_stream,
+                collective_key=self.collective_key,
+                validate_owner_collective_signature=validate_owner_collective_signature,
             )
 
         packed_handle = all_gather_matrix_shard_1d_into_async(
@@ -890,6 +898,21 @@ class MatrixFlatBuffer:
         if self.param_gather_strategy == "matrix_all_gather":
             return False
         return self.matrix_collective_backend in ("owner_broadcast", "custom")
+
+    def uses_owner_segment_collectives(self) -> bool:
+        return self._should_use_owner_segment_collectives()
+
+    def owner_segment_prefetch_skip_reason(self) -> str | None:
+        if not self._should_use_owner_segment_collectives():
+            return None
+        if self._owner_segment_collective_backend() != "custom":
+            return None
+        from matrix_fsdp.kernels.custom_collectives import custom_allgatherv_owner_prefetch_skip_reason
+
+        return custom_allgatherv_owner_prefetch_skip_reason()
+
+    def owner_segment_prefetch_order_gate_required(self) -> bool:
+        return self._should_use_owner_segment_collectives() and self.owner_segment_prefetch_skip_reason() is None
 
     def _owner_segment_collective_backend(self) -> str:
         if self.matrix_collective_backend == "custom":

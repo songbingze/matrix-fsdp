@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import count
+import os
 
 import torch
 import torch.distributed as dist
@@ -15,6 +17,9 @@ from matrix_fsdp.kernels import (
     custom_reduce_scatterv_owner_rank_chunks_1d_async,
     normalize_matrix_collective_backend,
 )
+
+_VALIDATE_OWNER_COLLECTIVE_SIGNATURE_ENV = "MATRIX_FSDP_VALIDATE_OWNER_COLLECTIVE_SIGNATURE"
+_OWNER_COLLECTIVE_SEQUENCE = count()
 
 
 @dataclass
@@ -43,6 +48,58 @@ class MatrixTensorCollectiveHandle:
 
 def dist_is_ready() -> bool:
     return dist.is_available() and dist.is_initialized()
+
+
+def validate_owner_collective_signature(
+    *,
+    collective_key: str | None,
+    backend: str,
+    rank_segments: tuple[tuple[LayoutSegment, ...], ...],
+    output_numel: int,
+    group=None,
+) -> None:
+    if not owner_collective_signature_validation_enabled():
+        return
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+
+    segment_signature = _rank_segments_signature(rank_segments)
+    shard_sizes = tuple(sum(segment.numel for segment in segments) for segments in rank_segments)
+    sequence = next(_OWNER_COLLECTIVE_SEQUENCE)
+    local_signature = (
+        "matrix_fsdp_owner_collective_v1",
+        sequence,
+        collective_key or "",
+        backend,
+        len(rank_segments),
+        output_numel,
+        shard_sizes,
+        segment_signature,
+    )
+    gathered: list[object] = [None for _ in range(dist.get_world_size(group=group))]
+    dist.all_gather_object(gathered, local_signature, group=group)
+    first = gathered[0]
+    if any(signature != first for signature in gathered):
+        detail = "\n".join(f"rank{idx}: {signature!r}" for idx, signature in enumerate(gathered))
+        raise RuntimeError(
+            "MatrixFSDP owner collective signature mismatch before entering the P2P/NCCL path. "
+            "All ranks must issue the same owner collective sequence with identical rank layout metadata.\n"
+            f"{detail}"
+        )
+
+
+def owner_collective_signature_validation_enabled() -> bool:
+    value = os.environ.get(_VALIDATE_OWNER_COLLECTIVE_SIGNATURE_ENV, "1").lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _rank_segments_signature(
+    rank_segments: tuple[tuple[LayoutSegment, ...], ...],
+) -> tuple[tuple[tuple[int, int, int, int], ...], ...]:
+    return tuple(
+        tuple((segment.global_start, segment.global_end, segment.local_start, segment.numel) for segment in segments)
+        for segments in rank_segments
+    )
 
 
 def all_gather_matrix_1d(
@@ -168,6 +225,8 @@ def all_gatherv_rank_segments_1d_into_async(
     backend: MatrixCollectiveBackend = "owner_broadcast",
     group=None,
     cuda_stream: torch.cuda.Stream | None = None,
+    collective_key: str | None = None,
+    validate_owner_collective_signature: bool = True,
 ) -> MatrixCollectiveHandle:
     backend = normalize_matrix_collective_backend(backend)
     if backend == "custom":
@@ -178,6 +237,8 @@ def all_gatherv_rank_segments_1d_into_async(
             rank,
             group=group,
             cuda_stream=cuda_stream,
+            collective_key=collective_key,
+            validate_signature=validate_owner_collective_signature,
         )
     if backend != "owner_broadcast":
         raise ValueError("all_gatherv_rank_segments_1d_into_async() supports 'owner_broadcast' or 'custom'.")
@@ -188,6 +249,8 @@ def all_gatherv_rank_segments_1d_into_async(
         rank,
         group=group,
         cuda_stream=cuda_stream,
+        collective_key=collective_key,
+        validate_signature=validate_owner_collective_signature,
     )
 
 
@@ -282,6 +345,8 @@ def broadcast_rank_segments_1d_into_async(
     *,
     group=None,
     cuda_stream: torch.cuda.Stream | None = None,
+    collective_key: str | None = None,
+    validate_signature: bool = True,
 ) -> MatrixCollectiveHandle:
     if local_tensor.ndim != 1:
         raise ValueError(f"local_tensor must be 1D, got shape {tuple(local_tensor.shape)}.")
@@ -303,6 +368,14 @@ def broadcast_rank_segments_1d_into_async(
         return MatrixCollectiveHandle(lambda: output_tensor)
 
     fused_rank_segments = coalesce_rank_segments(rank_segments)
+    if validate_signature:
+        validate_owner_collective_signature(
+            collective_key=collective_key,
+            backend="owner_broadcast",
+            rank_segments=fused_rank_segments,
+            output_numel=output_tensor.numel(),
+            group=group,
+        )
     if cuda_stream is not None:
         current_stream = torch.cuda.current_stream(local_tensor.device)
         cuda_stream.wait_stream(current_stream)

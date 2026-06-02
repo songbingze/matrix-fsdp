@@ -12,12 +12,15 @@ from matrix_fsdp.kernels import (
     native_kernel_status,
 )
 from matrix_fsdp.kernels.custom_collectives import (
+    custom_allgatherv_allows_owner_prefetch,
     custom_allgatherv_impl,
+    custom_allgatherv_owner_prefetch_skip_reason,
     custom_all_gatherv_rank_segments_1d_into_async,
     custom_reduce_scatterv_owner_rank_chunks_1d_async,
     default_custom_allgatherv_impl,
     experimental_custom_allgatherv_impls,
     is_experimental_custom_allgatherv_impl,
+    native_segment_p2p_enabled,
     native_sendrecv_chunk_fast_path_enabled,
     _rank_chunk_shard_sizes,
 )
@@ -35,6 +38,7 @@ from matrix_fsdp.kernels.native import (
     native_sendrecv_rank_chunks,
 )
 from matrix_fsdp.layout import LayoutSegment
+from matrix_fsdp.runtime.collectives import MatrixCollectiveHandle
 
 
 class MatrixKernelTest(unittest.TestCase):
@@ -88,10 +92,33 @@ class MatrixKernelTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"MATRIX_FSDP_ENABLE_NATIVE_NCCL": "unsafe_group_broadcast"}):
             self.assertTrue(native_nccl_collectives_enabled())
 
-    def test_custom_allgatherv_defaults_to_native_sendrecv(self):
+    def test_custom_allgatherv_defaults_to_native_group_broadcast(self):
         with mock.patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(custom_allgatherv_impl(), "native_sendrecv")
-        self.assertEqual(default_custom_allgatherv_impl(), "native_sendrecv")
+            self.assertEqual(custom_allgatherv_impl(), "native_group_broadcast")
+        self.assertEqual(default_custom_allgatherv_impl(), "native_group_broadcast")
+
+    def test_custom_owner_prefetch_is_backend_aware(self):
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch(
+            "matrix_fsdp.kernels.custom_collectives.native_kernel_available",
+            return_value=False,
+        ):
+            self.assertFalse(custom_allgatherv_allows_owner_prefetch("native_group_broadcast"))
+            self.assertFalse(custom_allgatherv_allows_owner_prefetch("uneven_all_gather"))
+            self.assertFalse(custom_allgatherv_allows_owner_prefetch("native_sendrecv"))
+            self.assertEqual(
+                custom_allgatherv_owner_prefetch_skip_reason("native_sendrecv"),
+                "custom_allgatherv:native_sendrecv",
+            )
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch(
+            "matrix_fsdp.kernels.custom_collectives.native_kernel_available",
+            return_value=True,
+        ):
+            self.assertTrue(custom_allgatherv_allows_owner_prefetch("native_group_broadcast"))
+            self.assertFalse(custom_allgatherv_allows_owner_prefetch("native_sendrecv"))
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_OWNER_SEGMENT_PREFETCH": "on"}):
+            self.assertTrue(custom_allgatherv_allows_owner_prefetch("native_sendrecv"))
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_OWNER_SEGMENT_PREFETCH": "off"}):
+            self.assertFalse(custom_allgatherv_allows_owner_prefetch("native_group_broadcast"))
 
     def test_custom_allgatherv_accepts_native_sendrecv_impl(self):
         with mock.patch.dict("os.environ", {"MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_sendrecv"}):
@@ -125,6 +152,12 @@ class MatrixKernelTest(unittest.TestCase):
             self.assertTrue(native_sendrecv_chunk_fast_path_enabled())
         with mock.patch.dict("os.environ", {"MATRIX_FSDP_NATIVE_SENDRECV_CHUNK_FAST_PATH": "0"}):
             self.assertFalse(native_sendrecv_chunk_fast_path_enabled())
+
+    def test_native_segment_p2p_is_opt_in(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(native_segment_p2p_enabled())
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_ALLOW_NATIVE_SEGMENT_P2P": "1"}):
+            self.assertTrue(native_segment_p2p_enabled())
 
     def test_native_nccl_rank_segment_metadata_is_cpu_readable(self):
         src_ranks, global_starts, local_starts, numels = _rank_segment_metadata_tensors(
@@ -245,6 +278,66 @@ class MatrixKernelTest(unittest.TestCase):
         chunk_sendrecv.assert_called_once()
         segment_sendrecv.assert_not_called()
 
+    def test_custom_allgatherv_does_not_use_native_segment_p2p_by_default(self):
+        local = torch.arange(3, dtype=torch.float32)
+        output = torch.empty(6, dtype=torch.float32)
+        rank_segments = (
+            (LayoutSegment(0, 2, 0), LayoutSegment(4, 5, 2)),
+            (LayoutSegment(2, 4, 0), LayoutSegment(5, 6, 2)),
+        )
+
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_sendrecv"}), mock.patch(
+            "matrix_fsdp.runtime.collectives.dist_is_ready",
+            return_value=True,
+        ), mock.patch(
+            "matrix_fsdp.kernels.custom_collectives.native_sendrecv_rank_segments",
+            return_value=True,
+        ) as segment_sendrecv, mock.patch(
+            "matrix_fsdp.kernels.custom_collectives._all_gather_uneven_rank_segments_1d_into_async",
+            return_value=MatrixCollectiveHandle(lambda: output),
+        ) as uneven_fallback:
+            handle = custom_all_gatherv_rank_segments_1d_into_async(
+                local,
+                output,
+                rank_segments,
+                0,
+            )
+
+        self.assertIs(handle.wait(), output)
+        segment_sendrecv.assert_not_called()
+        uneven_fallback.assert_called_once()
+
+    def test_custom_allgatherv_can_opt_into_native_segment_p2p(self):
+        local = torch.arange(3, dtype=torch.float32)
+        output = torch.empty(6, dtype=torch.float32)
+        rank_segments = (
+            (LayoutSegment(0, 2, 0), LayoutSegment(4, 5, 2)),
+            (LayoutSegment(2, 4, 0), LayoutSegment(5, 6, 2)),
+        )
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_sendrecv",
+                "MATRIX_FSDP_ALLOW_NATIVE_SEGMENT_P2P": "1",
+            },
+        ), mock.patch(
+            "matrix_fsdp.runtime.collectives.dist_is_ready",
+            return_value=True,
+        ), mock.patch(
+            "matrix_fsdp.kernels.custom_collectives.native_sendrecv_rank_segments",
+            return_value=True,
+        ) as segment_sendrecv:
+            handle = custom_all_gatherv_rank_segments_1d_into_async(
+                local,
+                output,
+                rank_segments,
+                0,
+            )
+
+        self.assertIs(handle.wait(), output)
+        segment_sendrecv.assert_called_once()
+
     def test_custom_allgatherv_can_try_rma_backend_for_rank_chunks(self):
         local = torch.arange(2, dtype=torch.float32)
         output = torch.empty(5, dtype=torch.float32)
@@ -289,6 +382,9 @@ class MatrixKernelTest(unittest.TestCase):
             "matrix_fsdp.kernels.custom_collectives.gin_device_rank_chunks",
             return_value=False,
         ) as gin_backend, mock.patch(
+            "matrix_fsdp.kernels.custom_collectives.native_sendrecv_rank_chunks",
+            return_value=True,
+        ) as chunk_sendrecv, mock.patch(
             "matrix_fsdp.kernels.custom_collectives.native_sendrecv_rank_segments",
             return_value=True,
         ) as segment_sendrecv:
@@ -301,7 +397,8 @@ class MatrixKernelTest(unittest.TestCase):
 
         self.assertIs(handle.wait(), output)
         gin_backend.assert_called_once()
-        segment_sendrecv.assert_called_once()
+        chunk_sendrecv.assert_called_once()
+        segment_sendrecv.assert_not_called()
 
 
 if __name__ == "__main__":

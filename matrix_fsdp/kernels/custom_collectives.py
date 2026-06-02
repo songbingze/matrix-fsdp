@@ -11,6 +11,7 @@ from matrix_fsdp.kernels.native import (
     native_copy_rank_chunk_from_packed,
     native_copy_rank_segments_to_full,
     native_group_broadcast_rank_segments,
+    native_kernel_available,
     native_sendrecv_rank_chunks,
     native_sendrecv_rank_segments,
 )
@@ -20,7 +21,9 @@ MatrixCollectiveBackend = Literal["torch", "owner_broadcast", "custom"]
 _MATRIX_COLLECTIVE_BACKENDS = {"torch", "owner_broadcast", "custom"}
 _CUSTOM_ALLGATHERV_IMPL_ENV = "MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL"
 _NATIVE_SENDRECV_CHUNK_FAST_PATH_ENV = "MATRIX_FSDP_NATIVE_SENDRECV_CHUNK_FAST_PATH"
-_DEFAULT_CUSTOM_ALLGATHERV_IMPL = "native_sendrecv"
+_ALLOW_NATIVE_SEGMENT_P2P_ENV = "MATRIX_FSDP_ALLOW_NATIVE_SEGMENT_P2P"
+_OWNER_SEGMENT_PREFETCH_ENV = "MATRIX_FSDP_OWNER_SEGMENT_PREFETCH"
+_DEFAULT_CUSTOM_ALLGATHERV_IMPL = "native_group_broadcast"
 _STABLE_CUSTOM_ALLGATHERV_IMPLS = {
     "native_group_broadcast",
     "native_sendrecv",
@@ -56,11 +59,14 @@ def custom_all_gatherv_rank_segments_1d_into_async(
     *,
     group=None,
     cuda_stream: torch.cuda.Stream | None = None,
+    collective_key: str | None = None,
+    validate_signature: bool = True,
 ):
     from matrix_fsdp.runtime.collectives import (
         MatrixCollectiveHandle,
         dist_broadcast_group_rank,
         dist_is_ready,
+        validate_owner_collective_signature,
     )
 
     _validate_owner_allgatherv_inputs(local_tensor, output_tensor, rank_segments, rank, cuda_stream)
@@ -72,6 +78,14 @@ def custom_all_gatherv_rank_segments_1d_into_async(
 
     impl = custom_allgatherv_impl()
     if impl == "native_group_broadcast":
+        if validate_signature:
+            validate_owner_collective_signature(
+                collective_key=collective_key,
+                backend="native_group_broadcast",
+                rank_segments=coalesce_rank_segments(rank_segments),
+                output_numel=output_tensor.numel(),
+                group=group,
+            )
         native_handle = _try_native_group_broadcast_rank_segments(
             local_tensor,
             output_tensor,
@@ -95,6 +109,14 @@ def custom_all_gatherv_rank_segments_1d_into_async(
     if impl == "native_sendrecv":
         shard_sizes = _rank_chunk_shard_sizes(rank_segments) if native_sendrecv_chunk_fast_path_enabled() else None
         if shard_sizes is not None:
+            if validate_signature:
+                validate_owner_collective_signature(
+                    collective_key=collective_key,
+                    backend="native_sendrecv_rank_chunks",
+                    rank_segments=_rank_chunk_segments_from_sizes(shard_sizes),
+                    output_numel=output_tensor.numel(),
+                    group=group,
+                )
             native_chunk_handle = _try_native_sendrecv_rank_chunks(
                 local_tensor,
                 output_tensor,
@@ -106,17 +128,26 @@ def custom_all_gatherv_rank_segments_1d_into_async(
             )
             if native_chunk_handle is not None:
                 return native_chunk_handle
-        native_handle = _try_native_sendrecv_rank_segments(
-            local_tensor,
-            output_tensor,
-            rank_segments,
-            rank,
-            group=group,
-            cuda_stream=cuda_stream,
-            force=True,
-        )
-        if native_handle is not None:
-            return native_handle
+        if native_segment_p2p_enabled():
+            if validate_signature:
+                validate_owner_collective_signature(
+                    collective_key=collective_key,
+                    backend="native_sendrecv_rank_segments",
+                    rank_segments=coalesce_rank_segments(rank_segments),
+                    output_numel=output_tensor.numel(),
+                    group=group,
+                )
+            native_handle = _try_native_sendrecv_rank_segments(
+                local_tensor,
+                output_tensor,
+                rank_segments,
+                rank,
+                group=group,
+                cuda_stream=cuda_stream,
+                force=True,
+            )
+            if native_handle is not None:
+                return native_handle
         return _all_gather_uneven_rank_segments_1d_into_async(
             local_tensor,
             output_tensor,
@@ -129,6 +160,14 @@ def custom_all_gatherv_rank_segments_1d_into_async(
     if impl in {"rma_put_signal", "gin_device"}:
         shard_sizes = _rank_chunk_shard_sizes(rank_segments)
         if shard_sizes is not None:
+            if validate_signature:
+                validate_owner_collective_signature(
+                    collective_key=collective_key,
+                    backend=impl,
+                    rank_segments=_rank_chunk_segments_from_sizes(shard_sizes),
+                    output_numel=output_tensor.numel(),
+                    group=group,
+                )
             backend = rma_putsignal_rank_chunks if impl == "rma_put_signal" else gin_device_rank_chunks
             native_handle = _try_experimental_rank_chunk_backend(
                 backend,
@@ -149,6 +188,8 @@ def custom_all_gatherv_rank_segments_1d_into_async(
             rank,
             group=group,
             cuda_stream=cuda_stream,
+            collective_key=collective_key,
+            validate_signature=validate_signature,
         )
 
     if impl == "uneven_all_gather":
@@ -175,6 +216,14 @@ def custom_all_gatherv_rank_segments_1d_into_async(
     if impl != "broadcast":
         raise AssertionError(f"Unhandled custom allgatherv impl: {impl}")
 
+    if validate_signature:
+        validate_owner_collective_signature(
+            collective_key=collective_key,
+            backend="custom_broadcast",
+            rank_segments=fused_rank_segments,
+            output_numel=output_tensor.numel(),
+            group=group,
+        )
     if cuda_stream is not None:
         current_stream = torch.cuda.current_stream(local_tensor.device)
         cuda_stream.wait_stream(current_stream)
@@ -384,18 +433,52 @@ def _native_sendrecv_or_uneven_fallback(
     *,
     group=None,
     cuda_stream: torch.cuda.Stream | None = None,
+    collective_key: str | None = None,
+    validate_signature: bool = True,
 ):
-    native_handle = _try_native_sendrecv_rank_segments(
-        local_tensor,
-        output_tensor,
-        rank_segments,
-        rank,
-        group=group,
-        cuda_stream=cuda_stream,
-        force=True,
-    )
-    if native_handle is not None:
-        return native_handle
+    from matrix_fsdp.runtime.collectives import validate_owner_collective_signature
+
+    shard_sizes = _rank_chunk_shard_sizes(rank_segments)
+    if shard_sizes is not None and native_sendrecv_chunk_fast_path_enabled():
+        if validate_signature:
+            validate_owner_collective_signature(
+                collective_key=collective_key,
+                backend="native_sendrecv_rank_chunks",
+                rank_segments=_rank_chunk_segments_from_sizes(shard_sizes),
+                output_numel=output_tensor.numel(),
+                group=group,
+            )
+        native_chunk_handle = _try_native_sendrecv_rank_chunks(
+            local_tensor,
+            output_tensor,
+            shard_sizes,
+            rank,
+            group=group,
+            cuda_stream=cuda_stream,
+            force=True,
+        )
+        if native_chunk_handle is not None:
+            return native_chunk_handle
+    if native_segment_p2p_enabled():
+        if validate_signature:
+            validate_owner_collective_signature(
+                collective_key=collective_key,
+                backend="native_sendrecv_rank_segments",
+                rank_segments=coalesce_rank_segments(rank_segments),
+                output_numel=output_tensor.numel(),
+                group=group,
+            )
+        native_handle = _try_native_sendrecv_rank_segments(
+            local_tensor,
+            output_tensor,
+            rank_segments,
+            rank,
+            group=group,
+            cuda_stream=cuda_stream,
+            force=True,
+        )
+        if native_handle is not None:
+            return native_handle
     return _all_gather_uneven_rank_segments_1d_into_async(
         local_tensor,
         output_tensor,
@@ -426,6 +509,27 @@ def is_experimental_custom_allgatherv_impl(value: str) -> bool:
     return value in _EXPERIMENTAL_CUSTOM_ALLGATHERV_IMPLS
 
 
+def custom_allgatherv_allows_owner_prefetch(value: str | None = None) -> bool:
+    policy = os.environ.get(_OWNER_SEGMENT_PREFETCH_ENV, "auto").lower()
+    impl = custom_allgatherv_impl() if value is None else value.lower()
+    if policy in {"0", "false", "no", "off"}:
+        return False
+    if policy in {"1", "true", "yes", "on"}:
+        return True
+    if policy != "auto":
+        raise ValueError(
+            f"{_OWNER_SEGMENT_PREFETCH_ENV} must be 'auto', 'on', or 'off', got {policy!r}."
+        )
+    return impl == "native_group_broadcast" and native_kernel_available()
+
+
+def custom_allgatherv_owner_prefetch_skip_reason(value: str | None = None) -> str | None:
+    impl = custom_allgatherv_impl() if value is None else value.lower()
+    if custom_allgatherv_allows_owner_prefetch(impl):
+        return None
+    return f"custom_allgatherv:{impl}"
+
+
 def custom_reduce_scatterv_impl() -> str:
     value = os.environ.get(_CUSTOM_REDUCE_SCATTERV_IMPL_ENV, "uneven_reduce_scatter").lower()
     if value not in _CUSTOM_REDUCE_SCATTERV_IMPLS:
@@ -437,6 +541,11 @@ def custom_reduce_scatterv_impl() -> str:
 def native_sendrecv_chunk_fast_path_enabled() -> bool:
     value = os.environ.get(_NATIVE_SENDRECV_CHUNK_FAST_PATH_ENV, "1").lower()
     return value not in {"0", "false", "no", "off"}
+
+
+def native_segment_p2p_enabled() -> bool:
+    value = os.environ.get(_ALLOW_NATIVE_SEGMENT_P2P_ENV, "").lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def _all_reduce_rank_segments_1d_into_async(
@@ -608,6 +717,18 @@ def _rank_chunk_shard_sizes(
         shard_sizes.append(segment.numel)
         cursor = segment.global_end
     return tuple(shard_sizes)
+
+
+def _rank_chunk_segments_from_sizes(shard_sizes: tuple[int, ...]) -> tuple[tuple[LayoutSegment, ...], ...]:
+    cursor = 0
+    rank_segments: list[tuple[LayoutSegment, ...]] = []
+    for shard_size in shard_sizes:
+        if shard_size == 0:
+            rank_segments.append(())
+            continue
+        rank_segments.append((LayoutSegment(cursor, cursor + shard_size, 0),))
+        cursor += shard_size
+    return tuple(rank_segments)
 
 
 def _validate_owner_reduce_scatterv_inputs(

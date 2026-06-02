@@ -2628,6 +2628,136 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         self.assertIs(units[0]._scheduler, scheduler)
         self.assertIs(units[1]._scheduler, scheduler)
 
+    def test_owner_prefetch_queue_enforces_forward_param_group_order(self):
+        class FakeOwnerFlatBuffer:
+            local_shard = None
+            matrix_collective_backend = "custom"
+
+            def owner_segment_prefetch_order_gate_required(self):
+                return True
+
+        class FakeRuntimeMetadata:
+            def __init__(self, index):
+                self.runtime_param_group_id = f"param_group_{index}"
+
+        class FakeUnit:
+            def __init__(self, index):
+                self.forward_prefetch_enabled = True
+                self.backward_prefetch_enabled = True
+                self.flat_buffer = FakeOwnerFlatBuffer()
+                self.runtime_metadata = FakeRuntimeMetadata(index)
+                self.world_size = 8
+                self._forward_prefetched = False
+                self._backward_prefetched = False
+                self.events = []
+
+            def set_scheduler(self, scheduler):
+                self.scheduler = scheduler
+
+            def set_comm_context(self, comm_context):
+                self.comm_context = comm_context
+
+            def set_full_param_buffer_pool(self, pool):
+                self.pool = pool
+
+            def prefetch_forward(self, **kwargs):
+                self._forward_prefetched = True
+                self.events.append("forward_prefetch")
+                return True
+
+            def prefetch_backward(self, **kwargs):
+                self._backward_prefetched = True
+                self.events.append("backward_prefetch")
+                return True
+
+            def _record_event(self, name):
+                self.events.append(name)
+
+        units = [FakeUnit(index) for index in range(3)]
+        scheduler = MatrixFSDPScheduler(units, max_unsharded_prefetch_units=1)
+
+        scheduler.on_pre_forward(units[1])
+        self.assertNotIn("forward_prefetch", units[2].events)
+        self.assertIn("forward_prefetch_skipped:owner_ordered_queue", " ".join(units[2].events))
+
+        scheduler.on_pre_forward(units[0])
+        scheduler.on_pre_forward(units[1])
+
+        self.assertEqual(units[1].events.count("forward_prefetch"), 1)
+        self.assertEqual(units[2].events.count("forward_prefetch"), 1)
+        self.assertEqual(scheduler.forward_prefetch_issued, 2)
+
+    def test_owner_prefetch_queue_enforces_backward_post_forward_order(self):
+        class FakeOwnerFlatBuffer:
+            local_shard = None
+            matrix_collective_backend = "custom"
+
+            def owner_segment_prefetch_order_gate_required(self):
+                return True
+
+        class FakeRuntimeMetadata:
+            def __init__(self, index):
+                self.runtime_param_group_id = f"param_group_{index}"
+
+        class FakeUnit:
+            def __init__(self, index):
+                self.forward_prefetch_enabled = True
+                self.backward_prefetch_enabled = True
+                self.flat_buffer = FakeOwnerFlatBuffer()
+                self.runtime_metadata = FakeRuntimeMetadata(index)
+                self.world_size = 8
+                self._forward_prefetched = False
+                self._backward_prefetched = False
+                self.events = []
+
+            def set_scheduler(self, scheduler):
+                self.scheduler = scheduler
+
+            def set_comm_context(self, comm_context):
+                self.comm_context = comm_context
+
+            def set_full_param_buffer_pool(self, pool):
+                self.pool = pool
+
+            def prefetch_forward(self, **kwargs):
+                self._forward_prefetched = True
+                self.events.append("forward_prefetch")
+                return True
+
+            def prefetch_backward(self, **kwargs):
+                self._backward_prefetched = True
+                self.events.append("backward_prefetch")
+                return True
+
+            def _record_event(self, name):
+                self.events.append(name)
+
+        units = [FakeUnit(index) for index in range(3)]
+        scheduler = MatrixFSDPScheduler(units, max_unsharded_prefetch_units=1)
+        for unit in units:
+            scheduler.record_post_forward(unit)
+
+        scheduler.on_pre_backward(units[1])
+        self.assertNotIn("backward_prefetch", units[0].events)
+        self.assertIn("backward_prefetch_skipped:owner_ordered_queue", " ".join(units[0].events))
+
+        scheduler.on_pre_backward(units[2])
+        scheduler.on_pre_backward(units[1])
+
+        self.assertEqual(units[1].events.count("backward_prefetch"), 1)
+        self.assertEqual(units[0].events.count("backward_prefetch"), 1)
+        self.assertEqual(scheduler.backward_prefetch_issued, 2)
+
+    def test_mixed_optimizer_inner_adamw_does_not_replace_unit_scheduler(self):
+        model = matrix_fully_shard(nn.Linear(4, 2))
+        unit = model._matrix_fsdp_param_group
+        scheduler = MatrixFSDPScheduler([unit])
+
+        optim = MixedMuonAdamWOptimizer((), model.parameters())
+
+        self.assertIs(unit._scheduler, scheduler)
+        self.assertIsNone(getattr(optim.adamw, "matrix_fsdp", None))
+
     def test_backward_prefetch_uses_actual_post_forward_order(self):
         class BranchModel(nn.Module):
             def __init__(self):
