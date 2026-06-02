@@ -31,6 +31,7 @@ class MatrixFSDPSchedulerConfig:
     backward_prefetch_timing: BackwardPrefetchTiming = "pre_backward"
     prefetch_policy: PrefetchPolicy = "static"
     max_cached_full_param_buffers_per_key: int = 0
+    max_cached_elastic_workspaces_per_key: int = 0
     max_active_full_param_buffers: int | None = None
     max_active_full_param_numel: int | None = None
     max_active_full_param_memory_mb: float | None = None
@@ -46,6 +47,7 @@ class MatrixFSDPSchedulerConfig:
             "backward_prefetch_timing": self.backward_prefetch_timing,
             "prefetch_policy": self.prefetch_policy,
             "max_cached_full_param_buffers_per_key": self.max_cached_full_param_buffers_per_key,
+            "max_cached_elastic_workspaces_per_key": self.max_cached_elastic_workspaces_per_key,
             "max_active_full_param_buffers": self.max_active_full_param_buffers,
             "max_active_full_param_numel": self.max_active_full_param_numel,
             "max_active_full_param_memory_mb": self.max_active_full_param_memory_mb,
@@ -90,6 +92,7 @@ class MatrixFSDPScheduler:
         backward_prefetch_timing: BackwardPrefetchTiming = "pre_backward",
         prefetch_policy: PrefetchPolicy = "static",
         max_cached_full_param_buffers_per_key: int = 0,
+        max_cached_elastic_workspaces_per_key: int = 0,
         max_active_full_param_buffers: int | None = None,
         max_active_full_param_numel: int | None = None,
         max_active_full_param_memory_mb: float | None = None,
@@ -107,6 +110,8 @@ class MatrixFSDPScheduler:
             raise ValueError("Pass only one of max_unsharded_prefetch_units or max_forward_prefetch_units.")
         if max_cached_full_param_buffers_per_key < 0:
             raise ValueError("max_cached_full_param_buffers_per_key must be non-negative.")
+        if max_cached_elastic_workspaces_per_key < 0:
+            raise ValueError("max_cached_elastic_workspaces_per_key must be non-negative.")
         if max_active_full_param_buffers is not None and max_active_full_param_buffers <= 0:
             raise ValueError("max_active_full_param_buffers must be positive.")
         if max_active_full_param_numel is not None and max_active_full_param_numel <= 0:
@@ -141,6 +146,7 @@ class MatrixFSDPScheduler:
         self.selected_prefetch_budget = self.selected_forward_prefetch_budget
         self.profile_results: tuple[PrefetchProfileResult, ...] = ()
         self.full_param_buffer_pool = FullParamBufferPool(max_cached_per_key=max_cached_full_param_buffers_per_key)
+        self.max_cached_elastic_workspaces_per_key = max_cached_elastic_workspaces_per_key
         self.max_active_full_param_buffers_limit = max_active_full_param_buffers
         self.max_active_full_param_numel_limit = max_active_full_param_numel
         self.max_active_full_param_bytes_limit = (
@@ -184,6 +190,8 @@ class MatrixFSDPScheduler:
                 unit.set_comm_context(self.comm_context)
             if hasattr(unit, "set_full_param_buffer_pool"):
                 unit.set_full_param_buffer_pool(self.full_param_buffer_pool)
+            if hasattr(unit, "set_elastic_workspace_cache_limit"):
+                unit.set_elastic_workspace_cache_limit(self.max_cached_elastic_workspaces_per_key)
 
     def next_forward_unit(self, unit: MatrixFSDPParamGroup) -> MatrixFSDPParamGroup | None:
         index = self._index_by_unit_id[id(unit)]
@@ -846,6 +854,7 @@ def configure_forward_prefetch(
     max_backward_prefetch_units: int | None = None,
     prefetch_policy: PrefetchPolicy = "static",
     max_cached_full_param_buffers_per_key: int = 0,
+    max_cached_elastic_workspaces_per_key: int = 0,
     max_active_full_param_buffers: int | None = None,
     max_active_full_param_numel: int | None = None,
     max_active_full_param_memory_mb: float | None = None,
@@ -861,6 +870,7 @@ def configure_forward_prefetch(
             max_backward_prefetch_units=max_backward_prefetch_units,
             prefetch_policy=prefetch_policy,
             max_cached_full_param_buffers_per_key=max_cached_full_param_buffers_per_key,
+            max_cached_elastic_workspaces_per_key=max_cached_elastic_workspaces_per_key,
             max_active_full_param_buffers=max_active_full_param_buffers,
             max_active_full_param_numel=max_active_full_param_numel,
             max_active_full_param_memory_mb=max_active_full_param_memory_mb,
@@ -876,6 +886,7 @@ def configure_forward_prefetch(
         max_backward_prefetch_units=max_backward_prefetch_units,
         prefetch_policy=prefetch_policy,
         max_cached_full_param_buffers_per_key=max_cached_full_param_buffers_per_key,
+        max_cached_elastic_workspaces_per_key=max_cached_elastic_workspaces_per_key,
         max_active_full_param_buffers=max_active_full_param_buffers,
         max_active_full_param_numel=max_active_full_param_numel,
         max_active_full_param_memory_mb=max_active_full_param_memory_mb,

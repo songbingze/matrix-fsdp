@@ -248,11 +248,22 @@ class OptimizerStateTest(unittest.TestCase):
         )
 
         classified = classify_matrix_optimizer_params(model)
-        optimizer = MatrixFSDPOptimizer.from_shard_hints(model, adamw_foreach=False)
+        optimizer = MatrixFSDPOptimizer.from_shard_hints(
+            model,
+            adamw_foreach=False,
+            max_cached_elastic_workspaces_per_key=1,
+        )
         summary = optimizer.optimizer_group_summary()
         groups_by_type = {group["optimizer_type"]: group for group in summary["groups"]}
 
         self.assertIsInstance(optimizer.optimizer, MixedMuonAdamWOptimizer)
+        self.assertEqual(optimizer.scheduler.max_cached_elastic_workspaces_per_key, 1)
+        self.assertEqual(
+            model._matrix_fsdp_param_group.flat_buffer.elastic_param_buffer.workspace.stats()[
+                "workspace_max_cached_per_key"
+            ],
+            1,
+        )
         self.assertFalse(optimizer.optimizer.adamw.defaults["foreach"])
         self.assertEqual(DEFAULT_MUON_ADJUST_LR_FN, "match_rms_adamw")
         self.assertEqual(optimizer.optimizer.muon.param_groups[0]["adjust_lr_fn"], DEFAULT_MUON_ADJUST_LR_FN)
@@ -280,10 +291,23 @@ class OptimizerStateTest(unittest.TestCase):
             auto_planner_policy="muon_shard_aware",
         )
 
-        optimizer = configure_optimizer(model, "mixed_muon_adamw", lr=0.004, weight_decay=0.07)
+        optimizer = configure_optimizer(
+            model,
+            "mixed_muon_adamw",
+            lr=0.004,
+            weight_decay=0.07,
+            max_cached_elastic_workspaces_per_key=1,
+        )
 
         self.assertIsInstance(optimizer, MixedMuonAdamWOptimizer)
         self.assertIs(optimizer.matrix_fsdp, optimizer)
+        self.assertEqual(optimizer.scheduler.max_cached_elastic_workspaces_per_key, 1)
+        self.assertEqual(
+            model._matrix_fsdp_param_group.flat_buffer.elastic_param_buffer.workspace.stats()[
+                "workspace_max_cached_per_key"
+            ],
+            1,
+        )
         self.assertEqual(optimizer.runtime_param_groups, [model._matrix_fsdp_param_group])
         self.assertEqual(optimizer.muon.defaults["lr"], 0.004)
         self.assertEqual(optimizer.adamw.defaults["lr"], 0.004)

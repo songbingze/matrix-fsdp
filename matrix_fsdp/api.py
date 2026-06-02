@@ -163,8 +163,9 @@ def _leading_dim_shard_hint(fqn: str, param: nn.Parameter) -> ParamShardHint:
 
 def _resolve_fully_shard_reshard_after_forward(value: bool | int | None) -> bool | int:
     if value is None:
-        # Match FSDP2's root-module default: keep full params after forward.
-        return False
+        # Keep the public API shape close to FSDP2 while defaulting MatrixFSDP
+        # to the training-friendly path that frees full params after forward.
+        return True
     return value
 
 

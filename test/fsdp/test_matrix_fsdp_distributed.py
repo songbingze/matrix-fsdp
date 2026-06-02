@@ -468,7 +468,7 @@ def _run_two_rank_default_fast_path_step(
         assert flat_buffer is not None
         _assert_default_fast_path_contract(
             unit,
-            expected_reshard_after_forward=api_name != "fully_shard",
+            expected_reshard_after_forward=True,
         )
         _assert_unit_layout_matches_flat_buffer(unit, rank)
 
@@ -489,11 +489,8 @@ def _run_two_rank_default_fast_path_step(
 
         sharded_loss = (sharded_model(x) - y).pow(2).mean()
         torch.testing.assert_close(sharded_loss, eager_loss)
-        if api_name == "fully_shard":
-            assert unit.lifecycle_state == FSDPLifecycleState.UNSHARDED
-        else:
-            assert unit.lifecycle_state == FSDPLifecycleState.FORWARD_RESHARDED
-            assert _full_param_buffer_released(flat_buffer)
+        assert unit.lifecycle_state == FSDPLifecycleState.FORWARD_RESHARDED
+        assert _full_param_buffer_released(flat_buffer)
 
         sharded_loss.backward()
         assert unit.lifecycle_state == FSDPLifecycleState.SHARDED

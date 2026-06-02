@@ -34,6 +34,12 @@ void sendrecv_rank_chunks(
     torch::Tensor output_tensor,
     torch::Tensor shard_sizes,
     int rank);
+void reduce_rank_chunks(
+    torch::Tensor packed_rank_chunks,
+    torch::Tensor local_output,
+    torch::Tensor shard_sizes,
+    int rank,
+    bool compact);
 
 #define MATRIX_CHECK_CUDA(tensor) TORCH_CHECK((tensor).is_cuda(), #tensor " must be a CUDA tensor")
 #define MATRIX_CHECK_CONTIGUOUS(tensor) TORCH_CHECK((tensor).is_contiguous(), #tensor " must be contiguous")
@@ -96,4 +102,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("group_broadcast_rank_segments", &group_broadcast_rank_segments, "Grouped NCCL broadcasts for rank segments");
   m.def("sendrecv_rank_segments", &sendrecv_rank_segments, "Grouped NCCL send/recv allgatherv for rank segments");
   m.def("sendrecv_rank_chunks", &sendrecv_rank_chunks, "Grouped NCCL send/recv allgatherv for contiguous rank chunks");
+  m.def("reduce_rank_chunks", &reduce_rank_chunks, "Grouped NCCL reduce-scatterv for contiguous rank chunks");
 }

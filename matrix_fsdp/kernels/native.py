@@ -256,6 +256,59 @@ def native_sendrecv_rank_chunks(
     return True
 
 
+def native_reduce_rank_chunks(
+    packed_rank_chunks: torch.Tensor,
+    local_output: torch.Tensor,
+    shard_sizes: tuple[int, ...],
+    rank: int,
+    *,
+    group=None,
+    divide_by_world: bool = True,
+    compact: bool,
+    cuda_stream: torch.cuda.Stream | None = None,
+    force: bool = False,
+) -> torch.cuda.Event | bool:
+    if not force and not native_nccl_collectives_enabled():
+        return False
+    module = _load_native_kernel()
+    if module is None or not _can_use_native_copy(packed_rank_chunks, local_output):
+        return False
+    if not hasattr(module, "reduce_rank_chunks"):
+        return False
+    if not dist.is_available() or not dist.is_initialized():
+        return False
+    _ensure_nccl_comm(module, rank, len(shard_sizes), group, packed_rank_chunks.device)
+    shard_size_tensor = _shard_size_metadata_tensor(shard_sizes)
+
+    if cuda_stream is not None:
+        current_stream = torch.cuda.current_stream(packed_rank_chunks.device)
+        cuda_stream.wait_stream(current_stream)
+        with torch.cuda.stream(cuda_stream):
+            module.reduce_rank_chunks(
+                packed_rank_chunks,
+                local_output,
+                shard_size_tensor,
+                rank,
+                compact,
+            )
+            if divide_by_world:
+                local_output.div_(len(shard_sizes))
+            event = torch.cuda.Event()
+            event.record(cuda_stream)
+        return event
+
+    module.reduce_rank_chunks(
+        packed_rank_chunks,
+        local_output,
+        shard_size_tensor,
+        rank,
+        compact,
+    )
+    if divide_by_world:
+        local_output.div_(len(shard_sizes))
+    return True
+
+
 def _can_use_native_copy(source: torch.Tensor, destination: torch.Tensor) -> bool:
     return (
         source.is_cuda

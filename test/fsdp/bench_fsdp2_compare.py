@@ -2057,7 +2057,7 @@ def _prepare_mode(
         _apply_fsdp2(model, mesh, config, shard_root=False)
         return model, _make_optimizer(model.parameters(), config)
     if mode == "matrix_api":
-        sharded_model = matrix_fully_shard_api(model, mesh=mesh)
+        sharded_model = _apply_matrix_api(model, mesh, config)
         return sharded_model, _make_optimizer(sharded_model.parameters(), config)
     if mode in DEFAULT_FAST_MATRIX_MODE_ALIASES:
         return _prepare_matrix_prefetch(
@@ -2411,6 +2411,17 @@ def _apply_fsdp2(model: nn.Module, mesh: DeviceMesh, config: FSDP2CompareConfig,
             torch_fully_shard(module, mesh=mesh, reshard_after_forward=True)
     if shard_root:
         torch_fully_shard(model, mesh=mesh, reshard_after_forward=True)
+
+
+def _apply_matrix_api(model: nn.Module, mesh: DeviceMesh, config: FSDP2CompareConfig) -> nn.Module:
+    wrapped_units = 0
+    for module in model.modules():
+        if _is_unit(module, config):
+            matrix_fully_shard_api(module, mesh=mesh)
+            wrapped_units += 1
+    if wrapped_units == 0:
+        return matrix_fully_shard_api(model, mesh=mesh)
+    return model
 
 
 def _make_optimizer(params, config: FSDP2CompareConfig) -> torch.optim.Optimizer:

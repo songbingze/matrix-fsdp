@@ -739,6 +739,10 @@ class MatrixFSDPParamGroup:
         if self.flat_buffer is not None:
             self.flat_buffer.set_full_param_buffer_pool(pool)
 
+    def set_elastic_workspace_cache_limit(self, max_cached_per_key: int) -> None:
+        if self.flat_buffer is not None:
+            self.flat_buffer.set_elastic_workspace_cache_limit(max_cached_per_key)
+
     def prefetch_forward(self, *, validate_owner_collective_signature: bool = False) -> bool:
         if self.flat_buffer is None or self.lifecycle_state != FSDPLifecycleState.SHARDED:
             return False

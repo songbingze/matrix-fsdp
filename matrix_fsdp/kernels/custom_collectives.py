@@ -12,6 +12,7 @@ from matrix_fsdp.kernels.native import (
     native_copy_rank_segments_to_full,
     native_group_broadcast_rank_segments,
     native_kernel_available,
+    native_reduce_rank_chunks,
     native_sendrecv_rank_chunks,
     native_sendrecv_rank_segments,
 )
@@ -44,7 +45,7 @@ _CUSTOM_ALLGATHERV_IMPLS = (
     _STABLE_CUSTOM_ALLGATHERV_IMPLS | _DIAGNOSTIC_CUSTOM_ALLGATHERV_IMPLS | _EXPERIMENTAL_CUSTOM_ALLGATHERV_IMPLS
 )
 _CUSTOM_REDUCE_SCATTERV_IMPL_ENV = "MATRIX_FSDP_CUSTOM_REDUCE_SCATTERV_IMPL"
-_CUSTOM_REDUCE_SCATTERV_IMPLS = {"reduce", "uneven_reduce_scatter"}
+_CUSTOM_REDUCE_SCATTERV_IMPLS = {"native_reduce", "reduce", "uneven_reduce_scatter"}
 
 
 def normalize_matrix_collective_backend(backend: str) -> MatrixCollectiveBackend:
@@ -547,7 +548,7 @@ def custom_allgatherv_owner_prefetch_skip_reason(value: str | None = None) -> st
 
 
 def custom_reduce_scatterv_impl() -> str:
-    value = os.environ.get(_CUSTOM_REDUCE_SCATTERV_IMPL_ENV, "uneven_reduce_scatter").lower()
+    value = os.environ.get(_CUSTOM_REDUCE_SCATTERV_IMPL_ENV, "native_reduce").lower()
     if value not in _CUSTOM_REDUCE_SCATTERV_IMPLS:
         valid = ", ".join(repr(name) for name in sorted(_CUSTOM_REDUCE_SCATTERV_IMPLS))
         raise ValueError(f"{_CUSTOM_REDUCE_SCATTERV_IMPL_ENV} must be one of {valid}, got {value!r}.")
@@ -560,8 +561,8 @@ def native_sendrecv_chunk_fast_path_enabled() -> bool:
 
 
 def auto_native_sendrecv_chunks_enabled() -> bool:
-    value = os.environ.get(_AUTO_NATIVE_SENDRECV_CHUNKS_ENV, "").lower()
-    return value in {"1", "true", "yes", "on"}
+    value = os.environ.get(_AUTO_NATIVE_SENDRECV_CHUNKS_ENV, "1").lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def native_segment_p2p_enabled() -> bool:
@@ -631,7 +632,23 @@ def custom_reduce_scatterv_owner_rank_chunks_1d_async(
         _copy_rank_chunk_from_packed(packed_rank_chunks, local_grad_shard, shard_sizes, rank, compact=compact)
         return MatrixTensorCollectiveHandle(local_grad_shard, lambda: local_grad_shard, _waited=True)
 
-    if custom_reduce_scatterv_impl() == "uneven_reduce_scatter":
+    reduce_impl = custom_reduce_scatterv_impl()
+    if reduce_impl == "native_reduce":
+        native_handle = _try_native_reduce_rank_chunks(
+            packed_rank_chunks,
+            shard_sizes,
+            rank,
+            group=group,
+            divide_by_world=divide_by_world,
+            cuda_stream=cuda_stream,
+            compact=compact,
+            force=True,
+        )
+        if native_handle is not None:
+            return native_handle
+        reduce_impl = "uneven_reduce_scatter"
+
+    if reduce_impl == "uneven_reduce_scatter":
         from matrix_fsdp.runtime.collectives import reduce_scatter_uneven_rank_chunks_1d_async
 
         return reduce_scatter_uneven_rank_chunks_1d_async(
@@ -685,6 +702,44 @@ def custom_reduce_scatterv_owner_rank_chunks_1d_async(
         return local_grad_shard
 
     return MatrixTensorCollectiveHandle(local_grad_shard, wait)
+
+
+def _try_native_reduce_rank_chunks(
+    packed_rank_chunks: torch.Tensor,
+    shard_sizes: tuple[int, ...],
+    rank: int,
+    *,
+    group=None,
+    divide_by_world: bool = True,
+    cuda_stream: torch.cuda.Stream | None = None,
+    compact: bool = False,
+    force: bool = False,
+):
+    from matrix_fsdp.runtime.collectives import MatrixTensorCollectiveHandle
+
+    local_grad_shard = packed_rank_chunks.new_empty(shard_sizes[rank])
+    native_result = native_reduce_rank_chunks(
+        packed_rank_chunks,
+        local_grad_shard,
+        shard_sizes,
+        rank,
+        group=group,
+        divide_by_world=divide_by_world,
+        compact=compact,
+        cuda_stream=cuda_stream,
+        force=force,
+    )
+    if native_result is False:
+        return None
+    if isinstance(native_result, torch.cuda.Event):
+        event = native_result
+
+        def wait() -> torch.Tensor:
+            torch.cuda.current_stream(packed_rank_chunks.device).wait_event(event)
+            return local_grad_shard
+
+        return MatrixTensorCollectiveHandle(local_grad_shard, wait)
+    return MatrixTensorCollectiveHandle(local_grad_shard, lambda: local_grad_shard)
 
 
 def _validate_owner_allgatherv_inputs(

@@ -16,6 +16,7 @@ from matrix_fsdp.kernels.custom_collectives import (
     custom_allgatherv_impl,
     custom_allgatherv_owner_prefetch_skip_reason,
     custom_all_gatherv_rank_segments_1d_into_async,
+    custom_reduce_scatterv_impl,
     custom_reduce_scatterv_owner_rank_chunks_1d_async,
     default_custom_allgatherv_impl,
     experimental_custom_allgatherv_impls,
@@ -110,10 +111,10 @@ class MatrixKernelTest(unittest.TestCase):
         )
 
         with mock.patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(resolve_custom_allgatherv_impl(rank_chunks), "native_group_broadcast")
-            self.assertEqual(resolve_custom_allgatherv_impl(rank_segments), "native_group_broadcast")
-        with mock.patch.dict("os.environ", {"MATRIX_FSDP_AUTO_NATIVE_SENDRECV_CHUNKS": "1"}):
             self.assertEqual(resolve_custom_allgatherv_impl(rank_chunks), "native_sendrecv")
+            self.assertEqual(resolve_custom_allgatherv_impl(rank_segments), "native_group_broadcast")
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_AUTO_NATIVE_SENDRECV_CHUNKS": "0"}):
+            self.assertEqual(resolve_custom_allgatherv_impl(rank_chunks), "native_group_broadcast")
             self.assertEqual(resolve_custom_allgatherv_impl(rank_segments), "native_group_broadcast")
         with mock.patch.dict("os.environ", {"MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_group_broadcast"}):
             self.assertEqual(resolve_custom_allgatherv_impl(rank_chunks), "native_group_broadcast")
@@ -184,11 +185,17 @@ class MatrixKernelTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"MATRIX_FSDP_NATIVE_SENDRECV_CHUNK_FAST_PATH": "0"}):
             self.assertFalse(native_sendrecv_chunk_fast_path_enabled())
 
-    def test_auto_native_sendrecv_chunks_is_opt_in(self):
+    def test_auto_native_sendrecv_chunks_defaults_enabled(self):
         with mock.patch.dict("os.environ", {}, clear=True):
-            self.assertFalse(auto_native_sendrecv_chunks_enabled())
-        with mock.patch.dict("os.environ", {"MATRIX_FSDP_AUTO_NATIVE_SENDRECV_CHUNKS": "1"}):
             self.assertTrue(auto_native_sendrecv_chunks_enabled())
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_AUTO_NATIVE_SENDRECV_CHUNKS": "0"}):
+            self.assertFalse(auto_native_sendrecv_chunks_enabled())
+
+    def test_custom_reduce_scatterv_defaults_to_native_reduce(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(custom_reduce_scatterv_impl(), "native_reduce")
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_CUSTOM_REDUCE_SCATTERV_IMPL": "uneven_reduce_scatter"}):
+            self.assertEqual(custom_reduce_scatterv_impl(), "uneven_reduce_scatter")
 
     def test_native_segment_p2p_is_opt_in(self):
         with mock.patch.dict("os.environ", {}, clear=True):
@@ -257,6 +264,70 @@ class MatrixKernelTest(unittest.TestCase):
         patched.assert_called_once()
         torch.testing.assert_close(handle.wait(), packed)
 
+    def test_custom_reduce_scatterv_can_use_native_reduce_chunk_path(self):
+        def fake_native_reduce(
+            packed_rank_chunks,
+            local_output,
+            shard_sizes,
+            rank,
+            *,
+            group=None,
+            divide_by_world=True,
+            compact,
+            cuda_stream=None,
+            force=False,
+        ):
+            offset = sum(shard_sizes[:rank]) if compact else rank * max(shard_sizes)
+            local_output.copy_(packed_rank_chunks[offset : offset + shard_sizes[rank]])
+            if divide_by_world:
+                local_output.div_(len(shard_sizes))
+            return True
+
+        packed = torch.arange(6, dtype=torch.float32)
+
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_CUSTOM_REDUCE_SCATTERV_IMPL": "native_reduce"}), mock.patch(
+            "matrix_fsdp.runtime.collectives.dist_is_ready",
+            return_value=True,
+        ), mock.patch(
+            "matrix_fsdp.kernels.custom_collectives.native_reduce_rank_chunks",
+            side_effect=fake_native_reduce,
+        ) as patched:
+            handle = custom_reduce_scatterv_owner_rank_chunks_1d_async(
+                packed,
+                (2, 4),
+                1,
+                compact=True,
+                divide_by_world=True,
+            )
+
+        patched.assert_called_once()
+        torch.testing.assert_close(handle.wait(), torch.tensor([1.0, 1.5, 2.0, 2.5]))
+
+    def test_custom_reduce_scatterv_native_reduce_falls_back_when_unavailable(self):
+        packed = torch.arange(6, dtype=torch.float32)
+        fallback = torch.tensor([2.0, 3.0, 4.0, 5.0])
+
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_CUSTOM_REDUCE_SCATTERV_IMPL": "native_reduce"}), mock.patch(
+            "matrix_fsdp.runtime.collectives.dist_is_ready",
+            return_value=True,
+        ), mock.patch(
+            "matrix_fsdp.kernels.custom_collectives.native_reduce_rank_chunks",
+            return_value=False,
+        ) as native_reduce, mock.patch(
+            "matrix_fsdp.runtime.collectives.reduce_scatter_uneven_rank_chunks_1d_async",
+            return_value=MatrixCollectiveHandle(lambda: fallback),
+        ) as uneven_reduce:
+            handle = custom_reduce_scatterv_owner_rank_chunks_1d_async(
+                packed,
+                (2, 4),
+                1,
+                compact=True,
+            )
+
+        native_reduce.assert_called_once()
+        uneven_reduce.assert_called_once()
+        self.assertIs(handle.wait(), fallback)
+
     def test_rank_chunk_shard_sizes_detects_contiguous_rank_chunks(self):
         self.assertEqual(
             _rank_chunk_shard_sizes(
@@ -315,7 +386,7 @@ class MatrixKernelTest(unittest.TestCase):
         chunk_sendrecv.assert_called_once()
         segment_sendrecv.assert_not_called()
 
-    def test_custom_allgatherv_auto_uses_group_broadcast_for_rank_chunks_by_default(self):
+    def test_custom_allgatherv_auto_uses_native_sendrecv_chunk_path_for_rank_chunks_by_default(self):
         local = torch.arange(2, dtype=torch.float32)
         output = torch.empty(5, dtype=torch.float32)
         rank_segments = (
@@ -341,10 +412,10 @@ class MatrixKernelTest(unittest.TestCase):
             )
 
         self.assertIs(handle.wait(), output)
-        chunk_sendrecv.assert_not_called()
-        group_broadcast.assert_called_once()
+        chunk_sendrecv.assert_called_once()
+        group_broadcast.assert_not_called()
 
-    def test_custom_allgatherv_auto_can_opt_into_native_sendrecv_chunk_path_for_rank_chunks(self):
+    def test_custom_allgatherv_auto_can_opt_out_of_native_sendrecv_chunk_path_for_rank_chunks(self):
         local = torch.arange(2, dtype=torch.float32)
         output = torch.empty(5, dtype=torch.float32)
         rank_segments = (
@@ -352,7 +423,7 @@ class MatrixKernelTest(unittest.TestCase):
             (LayoutSegment(2, 5, 0),),
         )
 
-        with mock.patch.dict("os.environ", {"MATRIX_FSDP_AUTO_NATIVE_SENDRECV_CHUNKS": "1"}), mock.patch(
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_AUTO_NATIVE_SENDRECV_CHUNKS": "0"}), mock.patch(
             "matrix_fsdp.runtime.collectives.dist_is_ready",
             return_value=True,
         ), mock.patch(
@@ -370,8 +441,8 @@ class MatrixKernelTest(unittest.TestCase):
             )
 
         self.assertIs(handle.wait(), output)
-        chunk_sendrecv.assert_called_once()
-        group_broadcast.assert_not_called()
+        chunk_sendrecv.assert_not_called()
+        group_broadcast.assert_called_once()
 
     def test_custom_allgatherv_does_not_use_native_segment_p2p_by_default(self):
         local = torch.arange(3, dtype=torch.float32)

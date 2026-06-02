@@ -451,7 +451,7 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         optim.step()
 
         self.assertEqual(unit.lifecycle_state, FSDPLifecycleState.SHARDED)
-        self.assertFalse(unit.reshard_after_forward_enabled)
+        self.assertTrue(unit.reshard_after_forward_enabled)
         self.assertTrue(unit.forward_prefetch_enabled)
         self.assertTrue(unit.backward_prefetch_enabled)
         self.assertTrue(unit.finalize_after_backward_enabled)
@@ -699,9 +699,9 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         self.assertTrue(unit_state["offload_policy"]["cpu_offload"])
         self.assertFalse(unit_state["offload_policy"]["pin_memory"])
 
-    def test_fully_shard_reshard_after_forward_none_matches_fsdp2_root_default(self):
+    def test_fully_shard_reshard_after_forward_none_defaults_to_training_fast_path(self):
         model = fully_shard(nn.Linear(4, 2), reshard_after_forward=None)
-        self.assertFalse(model._matrix_fsdp_param_group.state_dict()["reshard_after_forward"])
+        self.assertTrue(model._matrix_fsdp_param_group.state_dict()["reshard_after_forward"])
 
     def test_reshard_after_forward_int_rejects_without_subgroup_runtime(self):
         with self.assertRaisesRegex(ValueError, "non-trivial divisor"):
@@ -2983,6 +2983,9 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         self.assertEqual(optim.scheduler.full_param_buffer_pool.stats()["max_cached_per_key"], 0)
         self.assertFalse(optim.scheduler.trim_cuda_cache)
         self.assertFalse(optim.scheduler.maybe_trim_cuda_cache())
+        for unit in optim.runtime_param_groups:
+            stats = unit.flat_buffer.elastic_param_buffer.workspace.stats()
+            self.assertEqual(stats["workspace_max_cached_per_key"], 0)
 
     def test_api_defaults_to_fast_copy_in_no_saved_hooks_path(self):
         model = matrix_fully_shard(nn.Linear(4, 2))
@@ -3003,6 +3006,7 @@ class MatrixFSDPE2ETest(unittest.TestCase):
             max_forward_prefetch_units=0,
             max_backward_prefetch_units=0,
             max_cached_full_param_buffers_per_key=2,
+            max_cached_elastic_workspaces_per_key=1,
             max_pending_backward_reduces=0,
             trim_cuda_cache=True,
         )
@@ -3018,6 +3022,9 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         self.assertEqual(optim.scheduler.max_pending_backward_reduces, 0)
         self.assertTrue(optim.scheduler.trim_cuda_cache)
         self.assertEqual(optim.scheduler.full_param_buffer_pool.stats()["max_cached_per_key"], 2)
+        for unit in optim.runtime_param_groups:
+            stats = unit.flat_buffer.elastic_param_buffer.workspace.stats()
+            self.assertEqual(stats["workspace_max_cached_per_key"], 1)
 
     def test_optimizer_rejects_scheduler_config_with_explicit_scheduler_kwargs(self):
         model = matrix_fully_shard(nn.Linear(4, 2))

@@ -135,6 +135,20 @@ class ElasticParamBufferTest(unittest.TestCase):
         self.assertEqual(workspace.stats()["workspace_allocate_count"], 1)
         second.release()
 
+    def test_workspace_can_disable_released_tensor_cache(self):
+        workspace = ElasticParamBufferWorkspace(max_cached_per_key=0)
+        reference = torch.empty((), dtype=torch.float32)
+
+        first = workspace.acquire(reference, 8)
+        first.release()
+        second = workspace.acquire(reference, 8)
+
+        self.assertEqual(workspace.stats()["workspace_max_cached_per_key"], 0)
+        self.assertEqual(workspace.stats()["workspace_reuse_count"], 0)
+        self.assertEqual(workspace.stats()["workspace_allocate_count"], 2)
+        second.release()
+        self.assertEqual(workspace.stats()["workspace_allocated_tensors"], 0)
+
     def test_workspace_does_not_reuse_in_use_tensor(self):
         workspace = ElasticParamBufferWorkspace()
         reference = torch.empty((), dtype=torch.float32)

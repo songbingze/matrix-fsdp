@@ -74,8 +74,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--custom-reduce-scatterv-impl",
-        default="uneven_reduce_scatter",
-        choices=("uneven_reduce_scatter", "reduce"),
+        default="native_reduce",
+        choices=("native_reduce", "uneven_reduce_scatter", "reduce"),
         help="Custom MatrixFSDP reduce-scatterv implementation for the Matrix Muon mode.",
     )
     parser.add_argument("--output-json", default="", help="Optional path to write combined phase timing rows.")

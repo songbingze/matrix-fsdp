@@ -808,6 +808,9 @@ class MatrixFlatBuffer:
         self.full_buffer = None
         self.full_param_buffer_pool = pool
 
+    def set_elastic_workspace_cache_limit(self, max_cached_per_key: int) -> None:
+        self.elastic_param_buffer.workspace.set_max_cached_per_key(max_cached_per_key)
+
     def set_cuda_streams(
         self,
         *,

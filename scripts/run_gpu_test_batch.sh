@@ -240,7 +240,7 @@ run_compare_adamw_vs_muon() {
   local warmup_steps="${ADAMW_VS_MUON_WARMUP_STEPS:-2}"
   local steps="${ADAMW_VS_MUON_STEPS:-3}"
   local custom_gather="${MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL:-native_sendrecv}"
-  local custom_reduce="${MATRIX_FSDP_CUSTOM_REDUCE_SCATTERV_IMPL:-uneven_reduce_scatter}"
+  local custom_reduce="${MATRIX_FSDP_CUSTOM_REDUCE_SCATTERV_IMPL:-native_reduce}"
   run_cmd env \
     "MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL=$custom_gather" \
     "MATRIX_FSDP_CUSTOM_REDUCE_SCATTERV_IMPL=$custom_reduce" \

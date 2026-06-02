@@ -296,3 +296,60 @@ void sendrecv_rank_chunks(
   }
   MATRIX_NCCL_CHECK(ncclGroupEnd());
 }
+
+void reduce_rank_chunks(
+    torch::Tensor packed_rank_chunks,
+    torch::Tensor local_output,
+    torch::Tensor shard_sizes,
+    int rank,
+    bool compact) {
+  TORCH_CHECK(g_comm != nullptr, "MatrixFSDP native NCCL communicator is not initialized");
+  MATRIX_CHECK_CUDA(packed_rank_chunks);
+  MATRIX_CHECK_CUDA(local_output);
+  MATRIX_CHECK_CPU(shard_sizes);
+  MATRIX_CHECK_CONTIGUOUS(packed_rank_chunks);
+  MATRIX_CHECK_CONTIGUOUS(local_output);
+  MATRIX_CHECK_CONTIGUOUS(shard_sizes);
+  MATRIX_CHECK_INT64(shard_sizes);
+  TORCH_CHECK(packed_rank_chunks.dim() == 1, "packed_rank_chunks must be 1D");
+  TORCH_CHECK(local_output.dim() == 1, "local_output must be 1D");
+  TORCH_CHECK(packed_rank_chunks.scalar_type() == local_output.scalar_type(), "source and destination dtype mismatch");
+  TORCH_CHECK(shard_sizes.numel() == g_world_size, "shard_sizes length must match NCCL world size");
+  TORCH_CHECK(rank == g_rank, "rank must match initialized native NCCL rank");
+  TORCH_CHECK(rank >= 0 && rank < g_world_size, "rank out of range");
+
+  const int64_t* shard_size_ptr = shard_sizes.data_ptr<int64_t>();
+  std::vector<int64_t> shard_offsets(g_world_size + 1, 0);
+  int64_t max_shard_size = 0;
+  for (int peer = 0; peer < g_world_size; ++peer) {
+    const int64_t shard_size = shard_size_ptr[peer];
+    TORCH_CHECK(shard_size >= 0, "shard_sizes must be non-negative");
+    shard_offsets[peer + 1] = shard_offsets[peer] + shard_size;
+    max_shard_size = std::max(max_shard_size, shard_size);
+  }
+  const int64_t expected_numel = compact ? shard_offsets[g_world_size] : g_world_size * max_shard_size;
+  TORCH_CHECK(packed_rank_chunks.numel() == expected_numel, "packed_rank_chunks numel does not match shard layout");
+  TORCH_CHECK(local_output.numel() == shard_size_ptr[rank], "local_output numel must match this rank's shard size");
+  if (expected_numel == 0) {
+    return;
+  }
+
+  auto dtype = nccl_dtype_for(packed_rank_chunks.scalar_type());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const auto element_size = packed_rank_chunks.element_size();
+  char* packed_base = static_cast<char*>(packed_rank_chunks.data_ptr());
+  char* output_base = static_cast<char*>(local_output.data_ptr());
+
+  MATRIX_NCCL_CHECK(ncclGroupStart());
+  for (int owner_rank = 0; owner_rank < g_world_size; ++owner_rank) {
+    const int64_t count = shard_size_ptr[owner_rank];
+    if (count == 0) {
+      continue;
+    }
+    const int64_t chunk_offset = compact ? shard_offsets[owner_rank] : owner_rank * max_shard_size;
+    void* send_buffer = packed_base + chunk_offset * element_size;
+    void* recv_buffer = rank == owner_rank ? output_base : send_buffer;
+    MATRIX_NCCL_CHECK(ncclReduce(send_buffer, recv_buffer, count, dtype, ncclSum, owner_rank, g_comm, stream));
+  }
+  MATRIX_NCCL_CHECK(ncclGroupEnd());
+}
