@@ -70,6 +70,7 @@ def custom_all_gatherv_rank_segments_1d_into_async(
         MatrixCollectiveHandle,
         dist_broadcast_group_rank,
         dist_is_ready,
+        set_collective_metadata,
         validate_owner_collective_signature,
     )
 
@@ -100,7 +101,15 @@ def custom_all_gatherv_rank_segments_1d_into_async(
             force=True,
         )
         if native_handle is not None:
-            return native_handle
+            return set_collective_metadata(
+                native_handle,
+                kind="param_all_gather",
+                backend="custom",
+                impl="native_group_broadcast",
+                numel=output_tensor.numel(),
+                element_size=output_tensor.element_size(),
+                count=sum(1 for segments in coalesce_rank_segments(rank_segments) for segment in segments if segment.numel > 0),
+            )
         return _all_gather_uneven_rank_segments_1d_into_async(
             local_tensor,
             output_tensor,
@@ -131,7 +140,15 @@ def custom_all_gatherv_rank_segments_1d_into_async(
                 force=True,
             )
             if native_chunk_handle is not None:
-                return native_chunk_handle
+                return set_collective_metadata(
+                    native_chunk_handle,
+                    kind="param_all_gather",
+                    backend="custom",
+                    impl="native_sendrecv",
+                    numel=output_tensor.numel(),
+                    element_size=output_tensor.element_size(),
+                    count=sum(1 for size in shard_sizes if size > 0),
+                )
         if native_segment_p2p_enabled():
             if validate_signature:
                 validate_owner_collective_signature(
@@ -151,7 +168,15 @@ def custom_all_gatherv_rank_segments_1d_into_async(
                 force=True,
             )
             if native_handle is not None:
-                return native_handle
+                return set_collective_metadata(
+                    native_handle,
+                    kind="param_all_gather",
+                    backend="custom",
+                    impl="native_sendrecv_segments",
+                    numel=output_tensor.numel(),
+                    element_size=output_tensor.element_size(),
+                    count=sum(1 for segments in rank_segments for segment in segments if segment.numel > 0),
+                )
         return _all_gather_uneven_rank_segments_1d_into_async(
             local_tensor,
             output_tensor,
@@ -715,7 +740,7 @@ def _try_native_reduce_rank_chunks(
     compact: bool = False,
     force: bool = False,
 ):
-    from matrix_fsdp.runtime.collectives import MatrixTensorCollectiveHandle
+    from matrix_fsdp.runtime.collectives import MatrixTensorCollectiveHandle, set_collective_metadata
 
     local_grad_shard = packed_rank_chunks.new_empty(shard_sizes[rank])
     native_result = native_reduce_rank_chunks(
@@ -738,8 +763,18 @@ def _try_native_reduce_rank_chunks(
             torch.cuda.current_stream(packed_rank_chunks.device).wait_event(event)
             return local_grad_shard
 
-        return MatrixTensorCollectiveHandle(local_grad_shard, wait)
-    return MatrixTensorCollectiveHandle(local_grad_shard, lambda: local_grad_shard)
+        handle = MatrixTensorCollectiveHandle(local_grad_shard, wait)
+    else:
+        handle = MatrixTensorCollectiveHandle(local_grad_shard, lambda: local_grad_shard)
+    return set_collective_metadata(
+        handle,
+        kind="grad_reduce_scatter",
+        backend="custom",
+        impl="native_reduce",
+        numel=sum(shard_sizes),
+        element_size=packed_rank_chunks.element_size(),
+        count=sum(1 for size in shard_sizes if size > 0),
+    )
 
 
 def _validate_owner_allgatherv_inputs(

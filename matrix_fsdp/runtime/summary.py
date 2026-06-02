@@ -69,6 +69,12 @@ def summarize_runtime_events(
                     "pending_backward_reduces": event.pending_backward_reduces,
                     "param_data_alias_full_buffer": event.param_data_alias_full_buffer,
                     "param_data_alias_local_shard": event.param_data_alias_local_shard,
+                    "collective_kind": event.collective_kind,
+                    "collective_backend": event.collective_backend,
+                    "collective_impl": event.collective_impl,
+                    "collective_numel": event.collective_numel,
+                    "collective_bytes": event.collective_bytes,
+                    "collective_count": event.collective_count,
                 }
             )
     events.sort(key=lambda event_summary: event_summary["sequence"])
@@ -82,6 +88,7 @@ def summarize_runtime_events(
         "events": events,
         "event_stats": _summarize_event_stats(events),
         "communication_event_stats": _summarize_communication_event_stats(events),
+        "collective_event_stats": _summarize_collective_event_stats(events),
         "schedulers": schedulers,
         "communication_summary": _aggregate_communication_summaries(param_group_summaries),
     }
@@ -165,6 +172,7 @@ def format_runtime_events(summary: dict[str, Any]) -> str:
             )
     timed_event_stats = [stat for stat in summary.get("event_stats", ()) if stat["duration_count"] > 0]
     communication_event_stats = [stat for stat in summary.get("communication_event_stats", ()) if stat["duration_count"] > 0]
+    collective_event_stats = [stat for stat in summary.get("collective_event_stats", ()) if stat["duration_count"] > 0]
     if communication_event_stats:
         lines.append("  communication_event_stats:")
         for stat in communication_event_stats:
@@ -176,6 +184,21 @@ def format_runtime_events(summary: dict[str, Any]) -> str:
                 f"sum_ms={stat['duration_sum_ms']:.3f} "
                 f"avg_ms={stat['duration_avg_ms']:.3f} "
                 f"max_ms={stat['duration_max_ms']:.3f}"
+            )
+    if collective_event_stats:
+        lines.append("  collective_event_stats:")
+        for stat in collective_event_stats:
+            lines.append(
+                "    "
+                f"{stat['phase']} {stat['kind']}/{stat['impl']} "
+                f"backend={stat['backend']} "
+                f"count={stat['count']} "
+                f"timed={stat['duration_count']} "
+                f"sum_ms={stat['duration_sum_ms']:.3f} "
+                f"avg_ms={stat['duration_avg_ms']:.3f} "
+                f"max_ms={stat['duration_max_ms']:.3f} "
+                f"bytes={stat['collective_bytes']} "
+                f"ops={stat['collective_count']}"
             )
     if timed_event_stats:
         lines.append("  event_stats top_by_sum_ms:")
@@ -193,6 +216,7 @@ def format_runtime_events(summary: dict[str, Any]) -> str:
         duration = event_summary["duration_ms"]
         duration_text = "" if duration is None else f" duration_ms={duration:.3f}"
         memory_text = _format_event_memory(event_summary)
+        collective_text = _format_event_collective(event_summary)
         lines.append(
             "  "
             f"#{event_summary['sequence']} "
@@ -203,6 +227,7 @@ def format_runtime_events(summary: dict[str, Any]) -> str:
             f"name={event_summary['name']}"
             f"{duration_text}"
             f"{memory_text}"
+            f"{collective_text}"
         )
     return "\n".join(lines)
 
@@ -273,6 +298,64 @@ def _summarize_communication_event_stats(events: list[dict[str, Any]]) -> list[d
     return sorted(stats_by_category.values(), key=lambda stats: order.get(stats["category"], 99))
 
 
+def _summarize_collective_event_stats(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stats_by_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for event in events:
+        kind = event.get("collective_kind")
+        if not kind:
+            continue
+        phase = _collective_event_phase(event["name"])
+        backend = str(event.get("collective_backend") or "-")
+        impl = str(event.get("collective_impl") or "-")
+        key = (str(phase), str(kind), backend, impl)
+        stats = stats_by_key.setdefault(
+            key,
+            {
+                "phase": str(phase),
+                "kind": str(kind),
+                "backend": backend,
+                "impl": impl,
+                "count": 0,
+                "duration_count": 0,
+                "duration_sum_ms": 0.0,
+                "duration_avg_ms": 0.0,
+                "duration_max_ms": 0.0,
+                "collective_numel": 0,
+                "collective_bytes": 0,
+                "collective_count": 0,
+            },
+        )
+        stats["count"] += 1
+        stats["collective_numel"] += int(event.get("collective_numel", 0) or 0)
+        stats["collective_bytes"] += int(event.get("collective_bytes", 0) or 0)
+        stats["collective_count"] += int(event.get("collective_count", 0) or 0)
+        duration = event["duration_ms"]
+        if duration is None:
+            continue
+        stats["duration_count"] += 1
+        stats["duration_sum_ms"] += float(duration)
+        stats["duration_max_ms"] = max(stats["duration_max_ms"], float(duration))
+    for stats in stats_by_key.values():
+        if stats["duration_count"]:
+            stats["duration_avg_ms"] = stats["duration_sum_ms"] / stats["duration_count"]
+    phase_order = {
+        "all_gather_enqueue": 0,
+        "all_gather_wait": 1,
+        "reduce_scatter_enqueue": 2,
+        "reduce_scatter_wait": 3,
+    }
+    kind_order = {"param_all_gather": 0, "grad_reduce_scatter": 1}
+    return sorted(
+        stats_by_key.values(),
+        key=lambda stats: (
+            phase_order.get(stats["phase"], 99),
+            kind_order.get(stats["kind"], 99),
+            stats["backend"],
+            stats["impl"],
+        ),
+    )
+
+
 def _communication_event_category(name: str) -> str | None:
     if name == "enqueue_all_gather_full_params":
         return "all_gather_enqueue"
@@ -287,6 +370,14 @@ def _communication_event_category(name: str) -> str | None:
     if name in ("collect_grad_bucket", "prepare_grad_bucket_zero_copy"):
         return "grad_bucket_collect"
     return None
+
+
+def _collective_event_phase(name: str) -> str:
+    if name == "wait_all_gather_collective":
+        return "all_gather_wait"
+    if name == "wait_reduce_scatter_collective":
+        return "reduce_scatter_wait"
+    return _communication_event_category(name) or name
 
 
 def _summarize_schedulers(
@@ -385,6 +476,22 @@ def _format_event_memory(event_summary: dict[str, Any]) -> str:
     if not nonzero_fields:
         return ""
     return " " + " ".join(nonzero_fields)
+
+
+def _format_event_collective(event_summary: dict[str, Any]) -> str:
+    kind = event_summary.get("collective_kind")
+    if not kind:
+        return ""
+    fields = [
+        f"collective={kind}",
+        f"backend={event_summary.get('collective_backend')}",
+        f"impl={event_summary.get('collective_impl')}",
+    ]
+    if event_summary.get("collective_bytes"):
+        fields.append(f"collective_bytes={event_summary['collective_bytes']}")
+    if event_summary.get("collective_count"):
+        fields.append(f"collective_count={event_summary['collective_count']}")
+    return " " + " ".join(fields)
 
 
 def _format_rank_values(values: tuple[int, ...]) -> str:

@@ -30,6 +30,12 @@ class RuntimeEvent:
     pending_backward_reduces: int = 0
     param_data_alias_full_buffer: bool = False
     param_data_alias_local_shard: bool = False
+    collective_kind: str | None = None
+    collective_backend: str | None = None
+    collective_impl: str | None = None
+    collective_numel: int = 0
+    collective_bytes: int = 0
+    collective_count: int = 0
 
     @property
     def runtime_unit_id(self) -> RuntimeUnitId:

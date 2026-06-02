@@ -26,6 +26,12 @@ _OWNER_COLLECTIVE_SEQUENCE = count()
 class MatrixCollectiveHandle:
     _wait_fn: Callable[[], torch.Tensor]
     _result: torch.Tensor | None = None
+    collective_kind: str | None = None
+    collective_backend: str | None = None
+    collective_impl: str | None = None
+    collective_numel: int = 0
+    collective_bytes: int = 0
+    collective_count: int = 0
 
     def wait(self) -> torch.Tensor:
         if self._result is None:
@@ -38,12 +44,37 @@ class MatrixTensorCollectiveHandle:
     tensor: torch.Tensor
     _wait_fn: Callable[[], torch.Tensor]
     _waited: bool = False
+    collective_kind: str | None = None
+    collective_backend: str | None = None
+    collective_impl: str | None = None
+    collective_numel: int = 0
+    collective_bytes: int = 0
+    collective_count: int = 0
 
     def wait(self) -> torch.Tensor:
         if not self._waited:
             self.tensor = self._wait_fn()
             self._waited = True
         return self.tensor
+
+
+def set_collective_metadata(
+    handle: MatrixCollectiveHandle | MatrixTensorCollectiveHandle,
+    *,
+    kind: str,
+    backend: str | None,
+    impl: str | None,
+    numel: int,
+    element_size: int,
+    count: int,
+) -> MatrixCollectiveHandle | MatrixTensorCollectiveHandle:
+    handle.collective_kind = kind
+    handle.collective_backend = backend
+    handle.collective_impl = impl
+    handle.collective_numel = int(numel)
+    handle.collective_bytes = int(numel) * int(element_size)
+    handle.collective_count = int(count)
+    return handle
 
 
 def dist_is_ready() -> bool:

@@ -335,6 +335,7 @@ class MatrixFSDPParamGroup:
         self._record_event(
             "enqueue_all_gather_full_params",
             duration_ms=(perf_counter() - enqueue_start) * 1000.0,
+            collective_handle=self._unshard_handle,
         )
         self.lifecycle_state = FSDPLifecycleState.UNSHARDED
         self._unshard_inflight = True
@@ -347,11 +348,17 @@ class MatrixFSDPParamGroup:
         if self._unshard_inflight:
             if self._unshard_handle is None:
                 raise RuntimeError("wait_unshard() was called without a pending unshard handle.")
+            unshard_handle = self._unshard_handle
             wait_start = perf_counter()
-            self.flat_buffer.finish_all_gather_full_params(self._unshard_handle)
+            self.flat_buffer.finish_all_gather_full_params(unshard_handle)
             wait_duration_ms = (perf_counter() - wait_start) * 1000.0
             self._unshard_handle = None
             self._record_event(f"wait_unshard:{reason}", duration_ms=wait_duration_ms)
+            self._record_event(
+                "wait_all_gather_collective",
+                duration_ms=wait_duration_ms,
+                collective_handle=unshard_handle,
+            )
             self._record_event("unshard")
             self._record_full_param_buffer_snapshot(f"wait_unshard:{reason}")
         self._unshard_inflight = False
@@ -462,6 +469,7 @@ class MatrixFSDPParamGroup:
             "enqueue_reduce_scatter_grad_bucket",
             duration_ms=reduce_stats.reduce_scatter_enqueue_ms,
             reduce_scatter_input_bytes=reduce_stats.packed_bytes,
+            collective_handle=reduce_handle,
         )
         self._record_event("start_reduce_grad_bucket", duration_ms=(perf_counter() - reduce_start) * 1000.0)
         local_grad_shard = reduce_handle.tensor
@@ -485,8 +493,10 @@ class MatrixFSDPParamGroup:
     def wait_post_backward_reduce(self) -> None:
         if self.flat_buffer is None or self._post_backward_reduce_handle is None:
             return
+        reduce_handle = self._post_backward_reduce_handle
         wait_start = perf_counter()
-        local_grad_shard = self._post_backward_reduce_handle.wait()
+        local_grad_shard = reduce_handle.wait()
+        wait_duration_ms = (perf_counter() - wait_start) * 1000.0
         self._post_backward_reduce_handle = None
         should_accumulate = self._post_backward_reduce_should_accumulate
         self._post_backward_reduce_should_accumulate = False
@@ -494,7 +504,12 @@ class MatrixFSDPParamGroup:
             accumulated = self.flat_buffer.accumulate_local_grad_shard(local_grad_shard)
             if accumulated:
                 self._record_event("accumulate_local_grad_shard")
-        self._record_event("wait_reduce_grad_bucket", duration_ms=(perf_counter() - wait_start) * 1000.0)
+        self._record_event("wait_reduce_grad_bucket", duration_ms=wait_duration_ms)
+        self._record_event(
+            "wait_reduce_scatter_collective",
+            duration_ms=wait_duration_ms,
+            collective_handle=reduce_handle,
+        )
 
     def _finish_backward_with_local_grad_shard(self, local_grad_shard: torch.Tensor, *, finalize_start: float) -> None:
         if self.flat_buffer is None:
@@ -1051,6 +1066,7 @@ class MatrixFSDPParamGroup:
         *,
         duration_ms: float | None = None,
         reduce_scatter_input_bytes: int = 0,
+        collective_handle: MatrixCollectiveHandle | MatrixTensorCollectiveHandle | None = None,
     ) -> None:
         if not self.runtime_trace_enabled:
             return
@@ -1073,6 +1089,12 @@ class MatrixFSDPParamGroup:
                 pending_backward_reduces=int(snapshot["pending_backward_reduces"]),
                 param_data_alias_full_buffer=bool(snapshot["param_data_alias_full_buffer"]),
                 param_data_alias_local_shard=bool(snapshot["param_data_alias_local_shard"]),
+                collective_kind=getattr(collective_handle, "collective_kind", None),
+                collective_backend=getattr(collective_handle, "collective_backend", None),
+                collective_impl=getattr(collective_handle, "collective_impl", None),
+                collective_numel=int(getattr(collective_handle, "collective_numel", 0) or 0),
+                collective_bytes=int(getattr(collective_handle, "collective_bytes", 0) or 0),
+                collective_count=int(getattr(collective_handle, "collective_count", 0) or 0),
             )
         )
 

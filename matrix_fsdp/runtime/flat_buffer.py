@@ -690,7 +690,17 @@ class MatrixFlatBuffer:
             handle = _release_workspace_after_wait(handle, workspace_lease)
         if self.reduce_dtype is not None and self.reduce_dtype != self.local_shard.dtype:
             local_grad_shard = self._maybe_to_local_dtype(handle.wait())
-            handle = MatrixTensorCollectiveHandle(local_grad_shard, lambda: local_grad_shard, _waited=True)
+            handle = MatrixTensorCollectiveHandle(
+                local_grad_shard,
+                lambda: local_grad_shard,
+                _waited=True,
+                collective_kind=handle.collective_kind,
+                collective_backend=handle.collective_backend,
+                collective_impl=handle.collective_impl,
+                collective_numel=handle.collective_numel,
+                collective_bytes=handle.collective_bytes,
+                collective_count=handle.collective_count,
+            )
         return GradBucketReduceStart(
             handle=handle,
             stats=GradBucketReduceStartStats(
@@ -1306,4 +1316,13 @@ def _release_workspace_after_wait(
         finally:
             lease.release()
 
-    return MatrixTensorCollectiveHandle(handle.tensor, wait)
+    return MatrixTensorCollectiveHandle(
+        handle.tensor,
+        wait,
+        collective_kind=handle.collective_kind,
+        collective_backend=handle.collective_backend,
+        collective_impl=handle.collective_impl,
+        collective_numel=handle.collective_numel,
+        collective_bytes=handle.collective_bytes,
+        collective_count=handle.collective_count,
+    )

@@ -14,6 +14,7 @@ from matrix_fsdp import (
     summarize_runtime_events,
     summarize_param_groups,
 )
+from matrix_fsdp.runtime.runtime_event import RuntimeEvent
 
 
 class SummaryTest(unittest.TestCase):
@@ -347,6 +348,51 @@ class SummaryTest(unittest.TestCase):
         self.assertIn("max_grad_bucket_bytes=", text)
         self.assertIn("duration_ms=", text)
         self.assertIn("event_stats top_by_sum_ms:", text)
+
+    def test_format_runtime_events_includes_collective_stats(self):
+        model = matrix_fully_shard(nn.Linear(4, 2), reshard_after_forward=True)
+        unit = model._matrix_fsdp_param_group
+        unit.runtime_events.clear()
+        unit.runtime_events.extend(
+            (
+                RuntimeEvent(
+                    name="enqueue_all_gather_full_params",
+                    runtime_param_group_id=unit.runtime_metadata.runtime_param_group_id,
+                    rank=0,
+                    lifecycle_state="sharded",
+                    sequence=0,
+                    duration_ms=0.5,
+                    collective_kind="param_all_gather",
+                    collective_backend="custom",
+                    collective_impl="native_sendrecv",
+                    collective_numel=10,
+                    collective_bytes=40,
+                    collective_count=1,
+                ),
+                RuntimeEvent(
+                    name="wait_reduce_scatter_collective",
+                    runtime_param_group_id=unit.runtime_metadata.runtime_param_group_id,
+                    rank=0,
+                    lifecycle_state="sharded",
+                    sequence=1,
+                    duration_ms=1.5,
+                    collective_kind="grad_reduce_scatter",
+                    collective_backend="custom",
+                    collective_impl="native_reduce",
+                    collective_numel=10,
+                    collective_bytes=40,
+                    collective_count=1,
+                ),
+            )
+        )
+
+        text = format_runtime_events(summarize_runtime_events(model))
+
+        self.assertIn("collective_event_stats:", text)
+        self.assertIn("all_gather_enqueue param_all_gather/native_sendrecv", text)
+        self.assertIn("reduce_scatter_wait grad_reduce_scatter/native_reduce", text)
+        self.assertIn("collective=param_all_gather backend=custom impl=native_sendrecv", text)
+        self.assertIn("collective=grad_reduce_scatter backend=custom impl=native_reduce", text)
 
     def test_rejects_unwrapped_module(self):
         with self.assertRaisesRegex(ValueError, "at least one"):
