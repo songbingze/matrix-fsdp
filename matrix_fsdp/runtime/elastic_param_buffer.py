@@ -303,6 +303,7 @@ class ElasticParamBuffer:
         custom_allgather_resolver: CustomAllGatherResolver | None = None,
         native_kernel_available: bool = False,
         native_sendrecv_chunk_enabled: bool = True,
+        custom_reduce_scatterv_impl: str | None = None,
     ) -> dict[str, object]:
         owner_segment_collectives = owner_segment_backend is not None
         custom_policy = None
@@ -310,6 +311,14 @@ class ElasticParamBuffer:
         if owner_segment_backend == "custom" and self.layout.rank_segments is not None:
             if custom_allgather_resolver is not None:
                 custom_policy, resolved_custom_impl = custom_allgather_resolver(self.layout.rank_segments)
+        effective_reduce_backend = "owner_reduce"
+        resolved_custom_reduce_impl = None
+        if owner_segment_backend == "custom":
+            resolved_custom_reduce_impl = custom_reduce_scatterv_impl
+            if custom_reduce_scatterv_impl == "native_reduce":
+                effective_reduce_backend = "native_reduce" if native_kernel_available else "uneven_reduce_scatter"
+            elif custom_reduce_scatterv_impl is not None:
+                effective_reduce_backend = custom_reduce_scatterv_impl
 
         return {
             "param_gather_strategy": param_gather_strategy,
@@ -323,6 +332,8 @@ class ElasticParamBuffer:
             "owner_segment_backend": owner_segment_backend,
             "custom_allgatherv_policy": custom_policy,
             "resolved_custom_allgatherv_impl": resolved_custom_impl,
+            "effective_grad_reduce_backend": effective_reduce_backend,
+            "resolved_custom_reduce_scatterv_impl": resolved_custom_reduce_impl,
             **self.layout.as_summary(),
             **self.workspace_plan(
                 can_direct_all_gather=can_direct_all_gather,

@@ -60,16 +60,45 @@ class ElasticParamBufferTest(unittest.TestCase):
             can_direct_all_gather=False,
             owner_segment_backend="custom",
             custom_allgather_resolver=lambda segments: ("auto", "native_group_broadcast"),
+            custom_reduce_scatterv_impl="native_reduce",
+            native_kernel_available=True,
         )
 
         self.assertEqual(summary["effective_param_gather_backend"], "owner_segment:custom")
         self.assertEqual(summary["custom_allgatherv_policy"], "auto")
         self.assertEqual(summary["resolved_custom_allgatherv_impl"], "native_group_broadcast")
+        self.assertEqual(summary["effective_grad_reduce_backend"], "native_reduce")
+        self.assertEqual(summary["resolved_custom_reduce_scatterv_impl"], "native_reduce")
         self.assertTrue(summary["rank_chunk_fast_path"])
-        self.assertEqual(summary["workspace_preferred_kind"], "matrix_all_gather")
+        self.assertEqual(summary["workspace_preferred_kind"], "owner_segment")
         self.assertEqual(summary["workspace_padded_rank_chunks_numel"], 12)
         self.assertEqual(summary["workspace_compact_rank_chunks_numel"], 10)
+        self.assertEqual(summary["workspace_preferred_numel"], 10)
         self.assertAlmostEqual(summary["workspace_padding_waste_ratio"], 0.2)
+
+    def test_communication_summary_reports_native_reduce_fallback(self):
+        buffer = ElasticParamBuffer(
+            ElasticParamBufferLayout(
+                total_numel=10,
+                shard_sizes=(6, 4),
+                rank_segments=(
+                    (LayoutSegment(0, 6, 0),),
+                    (LayoutSegment(6, 10, 0),),
+                ),
+            )
+        )
+
+        summary = buffer.communication_summary(
+            param_gather_strategy="auto",
+            matrix_collective_backend="custom",
+            can_direct_all_gather=False,
+            owner_segment_backend="custom",
+            custom_reduce_scatterv_impl="native_reduce",
+            native_kernel_available=False,
+        )
+
+        self.assertEqual(summary["effective_grad_reduce_backend"], "uneven_reduce_scatter")
+        self.assertEqual(summary["resolved_custom_reduce_scatterv_impl"], "native_reduce")
 
     def test_workspace_plan_prefers_native_group_broadcast_when_available(self):
         buffer = ElasticParamBuffer(

@@ -211,6 +211,8 @@ class MatrixRuntimeCommunicationRow:
     param_groups: int
     gather_backend_counts: str
     resolved_custom_allgatherv_counts: str
+    grad_reduce_backend_counts: str
+    resolved_custom_reduce_scatterv_counts: str
     rank_chunk_fast_paths: int
     packed_full_order: int
     max_segment_count: int
@@ -793,6 +795,8 @@ def format_runtime_communication_table(rows: Sequence[MatrixRuntimeCommunication
         "groups",
         "gather_backends",
         "custom_impls",
+        "reduce_backends",
+        "custom_reduce",
         "chunk_fast",
         "full_order",
         "max_segments",
@@ -823,6 +827,8 @@ def format_runtime_communication_table(rows: Sequence[MatrixRuntimeCommunication
             str(row.param_groups),
             row.gather_backend_counts,
             row.resolved_custom_allgatherv_counts,
+            row.grad_reduce_backend_counts,
+            row.resolved_custom_reduce_scatterv_counts,
             str(row.rank_chunk_fast_paths),
             str(row.packed_full_order),
             str(row.max_segment_count),
@@ -1674,6 +1680,8 @@ def _runtime_communication_summary_mode(
             "num_param_groups": 0,
             "gather_backend_counts": {},
             "resolved_custom_allgatherv_counts": {},
+            "grad_reduce_backend_counts": {},
+            "resolved_custom_reduce_scatterv_counts": {},
             "rank_chunk_fast_path_count": 0,
             "packed_full_order_count": 0,
             "max_segment_count": 0,
@@ -1706,6 +1714,10 @@ def _runtime_communication_summary_mode(
         gather_backend_counts=_format_count_mapping(communication_summary["gather_backend_counts"]),
         resolved_custom_allgatherv_counts=_format_count_mapping(
             communication_summary["resolved_custom_allgatherv_counts"]
+        ),
+        grad_reduce_backend_counts=_format_count_mapping(communication_summary["grad_reduce_backend_counts"]),
+        resolved_custom_reduce_scatterv_counts=_format_count_mapping(
+            communication_summary["resolved_custom_reduce_scatterv_counts"]
         ),
         rank_chunk_fast_paths=int(communication_summary["rank_chunk_fast_path_count"]),
         packed_full_order=int(communication_summary["packed_full_order_count"]),

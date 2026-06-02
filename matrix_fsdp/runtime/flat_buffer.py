@@ -951,12 +951,17 @@ class MatrixFlatBuffer:
 
         native_available = False
         native_sendrecv_chunk_enabled = True
+        custom_reduce_impl = None
         if owner_backend == "custom":
-            from matrix_fsdp.kernels.custom_collectives import native_sendrecv_chunk_fast_path_enabled
+            from matrix_fsdp.kernels.custom_collectives import (
+                custom_reduce_scatterv_impl,
+                native_sendrecv_chunk_fast_path_enabled,
+            )
             from matrix_fsdp.kernels.native import native_kernel_available
 
             native_available = native_kernel_available()
             native_sendrecv_chunk_enabled = native_sendrecv_chunk_fast_path_enabled()
+            custom_reduce_impl = custom_reduce_scatterv_impl()
 
         return self.elastic_param_buffer.communication_summary(
             param_gather_strategy=self.param_gather_strategy,
@@ -966,6 +971,7 @@ class MatrixFlatBuffer:
             custom_allgather_resolver=resolve_custom,
             native_kernel_available=native_available,
             native_sendrecv_chunk_enabled=native_sendrecv_chunk_enabled,
+            custom_reduce_scatterv_impl=custom_reduce_impl,
         )
 
     def owner_segment_prefetch_skip_reason(self) -> str | None:

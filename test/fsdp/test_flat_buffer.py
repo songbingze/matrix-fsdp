@@ -597,11 +597,14 @@ class FlatBufferTest(unittest.TestCase):
         )
 
         flat_buffer = MatrixFlatBuffer(managed_params, plan, rank=0, matrix_collective_backend="custom")
-        summary = flat_buffer.communication_summary()
+        with mock.patch("matrix_fsdp.kernels.native.native_kernel_available", return_value=True):
+            summary = flat_buffer.communication_summary()
 
         self.assertEqual(summary["effective_param_gather_backend"], "owner_segment:custom")
         self.assertEqual(summary["custom_allgatherv_policy"], "auto")
-        self.assertEqual(summary["resolved_custom_allgatherv_impl"], "native_group_broadcast")
+        self.assertEqual(summary["resolved_custom_allgatherv_impl"], "native_sendrecv")
+        self.assertEqual(summary["effective_grad_reduce_backend"], "native_reduce")
+        self.assertEqual(summary["resolved_custom_reduce_scatterv_impl"], "native_reduce")
         self.assertTrue(summary["rank_chunk_fast_path"])
         self.assertTrue(summary["packed_rank_shards_are_full_tensor_order"])
         self.assertEqual(summary["segment_count"], 2)

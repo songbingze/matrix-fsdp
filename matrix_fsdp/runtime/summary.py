@@ -114,6 +114,8 @@ def format_param_group_summary(summary: dict[str, Any]) -> str:
             f"rank_comm={_format_rank_values(param_group_summary['rank_comm_bytes'])} "
             f"gather={param_group_summary['communication_summary']['effective_param_gather_backend']} "
             f"custom={param_group_summary['communication_summary']['resolved_custom_allgatherv_impl']} "
+            f"reduce={param_group_summary['communication_summary']['effective_grad_reduce_backend']} "
+            f"custom_reduce={param_group_summary['communication_summary']['resolved_custom_reduce_scatterv_impl']} "
             f"chunk_fast={param_group_summary['communication_summary']['rank_chunk_fast_path']} "
             f"pad_waste={param_group_summary['communication_summary']['padding_waste_ratio']:.3f} "
             f"imbalance={param_group_summary['communication_summary']['owner_imbalance_ratio']:.3f} "
@@ -412,6 +414,14 @@ def _aggregate_communication_summaries(param_group_summaries: list[dict[str, Any
         for summary in communication_summaries
         if summary.get("resolved_custom_allgatherv_impl") is not None
     )
+    grad_reduce_counts = Counter(
+        str(summary.get("effective_grad_reduce_backend")) for summary in communication_summaries
+    )
+    custom_reduce_counts = Counter(
+        str(summary.get("resolved_custom_reduce_scatterv_impl"))
+        for summary in communication_summaries
+        if summary.get("resolved_custom_reduce_scatterv_impl") is not None
+    )
     workspace_kind_counts = Counter(
         str(summary.get("workspace_preferred_kind"))
         for summary in communication_summaries
@@ -421,6 +431,8 @@ def _aggregate_communication_summaries(param_group_summaries: list[dict[str, Any
         "num_param_groups": len(communication_summaries),
         "gather_backend_counts": dict(sorted(gather_backend_counts.items())),
         "resolved_custom_allgatherv_counts": dict(sorted(custom_impl_counts.items())),
+        "grad_reduce_backend_counts": dict(sorted(grad_reduce_counts.items())),
+        "resolved_custom_reduce_scatterv_counts": dict(sorted(custom_reduce_counts.items())),
         "workspace_preferred_kind_counts": dict(sorted(workspace_kind_counts.items())),
         "rank_chunk_fast_path_count": sum(
             1 for summary in communication_summaries if summary.get("rank_chunk_fast_path")
@@ -522,6 +534,8 @@ def _summarize_param_group(param_group: MatrixFSDPParamGroup) -> dict[str, Any]:
             "owner_segment_backend": None,
             "custom_allgatherv_policy": None,
             "resolved_custom_allgatherv_impl": None,
+            "effective_grad_reduce_backend": None,
+            "resolved_custom_reduce_scatterv_impl": None,
             "rank_chunk_fast_path": False,
             "packed_rank_shards_are_full_tensor_order": False,
             "segment_count": 0,
