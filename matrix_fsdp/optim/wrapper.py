@@ -958,8 +958,11 @@ def _prepare_matrix_optimizer_step(
             continue
         if unit.finalize_after_backward_enabled and unit.finalized_after_backward:
             continue
-        if unit.lifecycle_state == FSDPLifecycleState.SHARDED and not _unit_has_grad(unit):
-            continue
+        if not _unit_has_grad(unit):
+            if unit.lifecycle_state == FSDPLifecycleState.SHARDED:
+                continue
+            if unit.discard_unconsumed_prefetch("optimizer_step_unused_prefetch"):
+                continue
         unit.finalize_backward()
     for unit in fsdp_param_groups:
         unit.assert_optimizer_ready("optimizer.step")

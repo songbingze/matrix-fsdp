@@ -2762,6 +2762,52 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         self.assertIs(units[0]._scheduler, scheduler)
         self.assertIs(units[1]._scheduler, scheduler)
 
+    def test_scheduler_skips_forward_prefetch_during_backward_recompute_post_forward(self):
+        class FakeRuntimeMetadata:
+            def __init__(self, index):
+                self.runtime_param_group_id = f"param_group_{index}"
+
+        class FakeUnit:
+            def __init__(self, index):
+                self.forward_prefetch_enabled = True
+                self.backward_prefetch_enabled = True
+                self.flat_buffer = None
+                self.runtime_metadata = FakeRuntimeMetadata(index)
+                self.world_size = 1
+                self._forward_prefetched = False
+                self._backward_prefetched = False
+                self.events = []
+                self.has_pending_backward_reduce = False
+
+            def set_scheduler(self, scheduler):
+                self.scheduler = scheduler
+
+            def set_comm_context(self, comm_context):
+                self.comm_context = comm_context
+
+            def set_full_param_buffer_pool(self, pool):
+                self.pool = pool
+
+            def prefetch_forward(self, **kwargs):
+                self._forward_prefetched = True
+                self.events.append("forward_prefetch")
+                return True
+
+            def prefetch_backward(self, **kwargs):
+                self._backward_prefetched = True
+                self.events.append("backward_prefetch")
+                return True
+
+        units = [FakeUnit(index) for index in range(2)]
+        scheduler = MatrixFSDPScheduler(units, max_unsharded_prefetch_units=1)
+
+        with mock.patch("matrix_fsdp.runtime.scheduler._is_in_backward_graph_task", return_value=True):
+            scheduler.record_post_forward(units[0])
+
+        self.assertEqual(scheduler._post_forward_order, [units[0]])
+        self.assertEqual(units[1].events.count("forward_prefetch"), 0)
+        self.assertEqual(scheduler.forward_prefetch_issued, 0)
+
     def test_owner_prefetch_queue_enforces_forward_param_group_order(self):
         class FakeOwnerFlatBuffer:
             local_shard = None

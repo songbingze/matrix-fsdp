@@ -624,9 +624,14 @@ class MatrixFlatBuffer:
         return self.start_reduce_grad_bucket_to_local_shard(bucket).wait()
 
     def start_reduce_grad_bucket_to_local_shard(self, bucket: MatrixGradBucket) -> MatrixTensorCollectiveHandle:
-        return self.start_reduce_grad_bucket_to_local_shard_with_stats(bucket).handle
+        return self.start_reduce_grad_bucket_to_local_shard_with_stats(bucket, collect_stats=False).handle
 
-    def start_reduce_grad_bucket_to_local_shard_with_stats(self, bucket: MatrixGradBucket) -> GradBucketReduceStart:
+    def start_reduce_grad_bucket_to_local_shard_with_stats(
+        self,
+        bucket: MatrixGradBucket,
+        *,
+        collect_stats: bool = True,
+    ) -> GradBucketReduceStart:
         if bucket.total_numel != self.plan.total_numel:
             raise RuntimeError(
                 f"Grad bucket has total_numel={bucket.total_numel}, expected {self.plan.total_numel}."
@@ -650,7 +655,7 @@ class MatrixFlatBuffer:
         if self._is_single_rank_shard_group():
             packed_rank_chunks = bucket.packed_input
             needs_copy_in = packed_rank_chunks is None
-            layout_kind = classify_copy_in_layout(bucket)
+            layout_kind = classify_copy_in_layout(bucket) if collect_stats else "unknown"
             copy_in_ms = 0.0
             workspace_lease = None
             if packed_rank_chunks is None:
@@ -659,9 +664,10 @@ class MatrixFlatBuffer:
                     bucket.world_size * bucket.max_shard_size,
                 )
                 packed_rank_chunks = workspace_lease.tensor
-                copy_start = perf_counter()
+                copy_start = perf_counter() if collect_stats else None
                 fill_reduce_scatter_input(bucket, packed_rank_chunks)
-                copy_in_ms = (perf_counter() - copy_start) * 1000.0
+                if collect_stats:
+                    copy_in_ms = (perf_counter() - copy_start) * 1000.0
             local_grad_shard = self._maybe_to_local_dtype(packed_rank_chunks[: self.local_numel].contiguous())
             if workspace_lease is not None:
                 local_grad_shard = local_grad_shard.clone()
@@ -681,7 +687,7 @@ class MatrixFlatBuffer:
             )
         if self.replicate_group is not None and self.replicate_world_size > 1:
             workspace_lease = None
-            copy_start = perf_counter()
+            copy_start = perf_counter() if collect_stats else None
             if bucket.packed_input is not None:
                 packed_rank_chunks = self._maybe_to_reduce_dtype(bucket.packed_input)
             else:
@@ -691,8 +697,8 @@ class MatrixFlatBuffer:
                 )
                 packed_rank_chunks = workspace_lease.tensor
                 fill_reduce_scatter_input(bucket, packed_rank_chunks)
-            copy_in_ms = (perf_counter() - copy_start) * 1000.0
-            enqueue_start = perf_counter()
+            copy_in_ms = (perf_counter() - copy_start) * 1000.0 if collect_stats else 0.0
+            enqueue_start = perf_counter() if collect_stats else None
             local_grad_shard = reduce_scatter_padded_rank_chunks_1d(
                 packed_rank_chunks,
                 self.local_numel,
@@ -707,17 +713,17 @@ class MatrixFlatBuffer:
             return GradBucketReduceStart(
                 handle=handle,
                 stats=GradBucketReduceStartStats(
-                    layout_kind=classify_copy_in_layout(bucket),
+                    layout_kind=classify_copy_in_layout(bucket) if collect_stats else "unknown",
                     needs_copy_in=bucket.packed_input is None,
                     copy_in_ms=copy_in_ms,
-                    reduce_scatter_enqueue_ms=(perf_counter() - enqueue_start) * 1000.0,
+                    reduce_scatter_enqueue_ms=(perf_counter() - enqueue_start) * 1000.0 if collect_stats else 0.0,
                     packed_numel=packed_rank_chunks.numel(),
                     packed_bytes=packed_rank_chunks.numel() * packed_rank_chunks.element_size(),
                 ),
             )
         packed_rank_chunks = bucket.packed_input
         needs_copy_in = packed_rank_chunks is None
-        layout_kind = classify_copy_in_layout(bucket)
+        layout_kind = classify_copy_in_layout(bucket) if collect_stats else "unknown"
         packed_input_is_compact = bucket.packed_input_is_compact
         workspace_kind = "compact_rank_chunks" if packed_input_is_compact else "padded_rank_chunks"
         workspace_numel = packed_rank_chunks.numel() if packed_rank_chunks is not None else 0
@@ -750,15 +756,16 @@ class MatrixFlatBuffer:
             workspace_persistent = bool(getattr(workspace_lease, "persistent", False))
         copy_in_ms = 0.0
         if needs_copy_in:
-            copy_start = perf_counter()
+            copy_start = perf_counter() if collect_stats else None
             if packed_input_is_compact:
                 self._fill_compact_owner_reduce_scatter_input(bucket, packed_rank_chunks)
                 layout_kind = "compact_owner"
             else:
                 fill_reduce_scatter_input(bucket, packed_rank_chunks)
-            copy_in_ms = (perf_counter() - copy_start) * 1000.0
+            if collect_stats:
+                copy_in_ms = (perf_counter() - copy_start) * 1000.0
             del bucket
-        enqueue_start = perf_counter()
+        enqueue_start = perf_counter() if collect_stats else None
         if self._should_use_owner_segment_collectives():
             handle = reduce_scatterv_owner_rank_chunks_1d_async(
                 packed_rank_chunks,
@@ -800,7 +807,7 @@ class MatrixFlatBuffer:
                 layout_kind=layout_kind,
                 needs_copy_in=needs_copy_in,
                 copy_in_ms=copy_in_ms,
-                reduce_scatter_enqueue_ms=(perf_counter() - enqueue_start) * 1000.0,
+                reduce_scatter_enqueue_ms=(perf_counter() - enqueue_start) * 1000.0 if collect_stats else 0.0,
                 packed_numel=packed_rank_chunks.numel(),
                 packed_bytes=packed_rank_chunks.numel() * packed_rank_chunks.element_size(),
                 workspace_kind=workspace_kind,

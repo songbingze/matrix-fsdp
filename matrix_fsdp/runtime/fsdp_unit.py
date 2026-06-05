@@ -227,6 +227,8 @@ class MatrixFSDPParamGroup:
         self._checkpoint_recompute_forward_depth = 0
         self._post_backward_seen_param_ids: set[int] = set()
         self._post_backward_expected_param_ids: set[int] = set()
+        self._post_backward_seen_count = 0
+        self._post_backward_expected_count = 0
         self._post_backward_param_by_id: dict[int, ManagedParam] = {}
         self._no_sync_depth = 0
         self._defer_backward_reduce = False
@@ -330,7 +332,8 @@ class MatrixFSDPParamGroup:
                 f"{old_state.value} -> {new_state.value}; allowed from: {allowed}."
             )
         self.lifecycle_state = new_state
-        self._record_event(f"lifecycle_transition:{old_state.value}->{new_state.value}:{reason}")
+        if self.runtime_trace_enabled:
+            self._record_event(f"lifecycle_transition:{old_state.value}->{new_state.value}:{reason}")
         self._validate_lifecycle_invariants(reason)
 
     def _validate_lifecycle_invariants(self, reason: str) -> None:
@@ -364,24 +367,28 @@ class MatrixFSDPParamGroup:
     ) -> bool:
         if self.flat_buffer is None or self.lifecycle_state == FSDPLifecycleState.UNSHARDED:
             return False
-        self._record_event(f"start_unshard:{reason}")
+        trace = self.runtime_trace_enabled
+        if trace:
+            self._record_event(f"start_unshard:{reason}")
         is_prefetch = reason.endswith("_prefetch")
         if validate_owner_collective_signature is None:
             validate_owner_collective_signature = not is_prefetch
-        enqueue_start = perf_counter()
+        enqueue_start = perf_counter() if trace else None
         if (
             self._scheduler is not None
             and self._scheduler.wait_for_post_optimizer_event_before_all_gather()
         ):
-            self._record_event("wait_post_optimizer_event_before_all_gather")
+            if trace:
+                self._record_event("wait_post_optimizer_event_before_all_gather")
         self._unshard_handle = self.flat_buffer.start_all_gather_full_params(
             validate_owner_collective_signature=validate_owner_collective_signature,
         )
-        self._record_event(
-            "enqueue_all_gather_full_params",
-            duration_ms=(perf_counter() - enqueue_start) * 1000.0,
-            collective_handle=self._unshard_handle,
-        )
+        if trace:
+            self._record_event(
+                "enqueue_all_gather_full_params",
+                duration_ms=(perf_counter() - enqueue_start) * 1000.0,
+                collective_handle=self._unshard_handle,
+            )
         self._unshard_inflight = True
         self._transition_lifecycle_state(
             FSDPLifecycleState.UNSHARDED,
@@ -398,28 +405,34 @@ class MatrixFSDPParamGroup:
             if self._unshard_handle is None:
                 raise RuntimeError("wait_unshard() was called without a pending unshard handle.")
             unshard_handle = self._unshard_handle
-            total_start = perf_counter()
-            wait_start = perf_counter()
-            full_buffer = unshard_handle.wait()
-            wait_duration_ms = (perf_counter() - wait_start) * 1000.0
-            materialize_start = perf_counter()
-            self.flat_buffer.use_full_param_buffer(full_buffer)
-            materialize_duration_ms = (perf_counter() - materialize_start) * 1000.0
-            total_duration_ms = (perf_counter() - total_start) * 1000.0
+            trace = self.runtime_trace_enabled
+            if trace:
+                total_start = perf_counter()
+                wait_start = perf_counter()
+                full_buffer = unshard_handle.wait()
+                wait_duration_ms = (perf_counter() - wait_start) * 1000.0
+                materialize_start = perf_counter()
+                self.flat_buffer.use_full_param_buffer(full_buffer)
+                materialize_duration_ms = (perf_counter() - materialize_start) * 1000.0
+                total_duration_ms = (perf_counter() - total_start) * 1000.0
+            else:
+                full_buffer = unshard_handle.wait()
+                self.flat_buffer.use_full_param_buffer(full_buffer)
             self._unshard_handle = None
-            self._record_event(
-                "wait_all_gather_handle",
-                duration_ms=wait_duration_ms,
-                collective_handle=unshard_handle,
-            )
-            self._record_event(
-                "wait_all_gather_collective",
-                duration_ms=wait_duration_ms,
-                collective_handle=unshard_handle,
-            )
-            self._record_event("materialize_full_param_views", duration_ms=materialize_duration_ms)
-            self._record_event(f"wait_unshard:{reason}", duration_ms=total_duration_ms)
-            self._record_event("unshard")
+            if trace:
+                self._record_event(
+                    "wait_all_gather_handle",
+                    duration_ms=wait_duration_ms,
+                    collective_handle=unshard_handle,
+                )
+                self._record_event(
+                    "wait_all_gather_collective",
+                    duration_ms=wait_duration_ms,
+                    collective_handle=unshard_handle,
+                )
+                self._record_event("materialize_full_param_views", duration_ms=materialize_duration_ms)
+                self._record_event(f"wait_unshard:{reason}", duration_ms=total_duration_ms)
+                self._record_event("unshard")
             self._record_full_param_buffer_snapshot(f"wait_unshard:{reason}")
         self._unshard_inflight = False
         self._validate_lifecycle_invariants(f"wait_unshard:{reason}")
@@ -429,7 +442,8 @@ class MatrixFSDPParamGroup:
     def reshard_after_forward(self, *, needs_pre_backward_unshard: bool | None = None) -> None:
         if self.flat_buffer is None or self.lifecycle_state != FSDPLifecycleState.UNSHARDED:
             return
-        reshard_start = perf_counter()
+        trace = self.runtime_trace_enabled
+        reshard_start = perf_counter() if trace else None
         if needs_pre_backward_unshard is None:
             needs_pre_backward_unshard = torch.is_grad_enabled()
         target_state = (
@@ -437,27 +451,30 @@ class MatrixFSDPParamGroup:
             if needs_pre_backward_unshard
             else FSDPLifecycleState.SHARDED
         )
-        local_view_start = perf_counter()
+        local_view_start = perf_counter() if trace else None
         self.flat_buffer.use_local_shards(
             preserve_full_grad_buffer=self._defer_backward_reduce,
             preserve_grad_bucket_input=self._defer_backward_reduce,
             preserve_local_grad_shard=True,
         )
-        self._record_event("use_local_shards:post_forward", duration_ms=(perf_counter() - local_view_start) * 1000.0)
-        clear_start = perf_counter()
+        if trace:
+            self._record_event("use_local_shards:post_forward", duration_ms=(perf_counter() - local_view_start) * 1000.0)
+        clear_start = perf_counter() if trace else None
         clear_stats = self.flat_buffer.clear_full_params(
             shrink_storage=self.reshard_after_forward_enabled
             and needs_pre_backward_unshard
             and not self.use_saved_tensor_hooks
         )
-        self._record_event("clear_full_params:post_forward", duration_ms=(perf_counter() - clear_start) * 1000.0)
+        if trace:
+            self._record_event("clear_full_params:post_forward", duration_ms=(perf_counter() - clear_start) * 1000.0)
         self._record_full_param_clear_event("post_forward", clear_stats)
         self._transition_lifecycle_state(
             target_state,
             reason="reshard_after_forward",
             allowed_from=(FSDPLifecycleState.UNSHARDED,),
         )
-        self._record_event("reshard_after_forward", duration_ms=(perf_counter() - reshard_start) * 1000.0)
+        if trace:
+            self._record_event("reshard_after_forward", duration_ms=(perf_counter() - reshard_start) * 1000.0)
         self._record_full_param_buffer_snapshot("reshard_after_forward")
 
     def finalize_backward(self) -> None:
@@ -473,7 +490,7 @@ class MatrixFSDPParamGroup:
             self._finalize_deferred_backward_from_sharded()
             return
         if self.backward_reduce_strategy in ("per_param", "per_param_allreduce") and self.flat_buffer.local_grad_accumulator is not None:
-            finalize_start = perf_counter()
+            finalize_start = self._trace_start()
             self._finish_backward_with_local_grad_shard(
                 self.flat_buffer.finish_local_grad_accumulator(),
                 finalize_start=finalize_start,
@@ -487,122 +504,136 @@ class MatrixFSDPParamGroup:
             )
         if self.lifecycle_state != FSDPLifecycleState.UNSHARDED:
             raise RuntimeError("finalize_backward() expects parameters to be unsharded.")
-        finalize_start = perf_counter()
+        finalize_start = self._trace_start()
         if self.backward_reduce_strategy == "bucket_reduce_scatter":
             self._finish_backward_with_grad_bucket(finalize_start=finalize_start)
             return
-        reduce_start = perf_counter()
+        reduce_start = self._trace_start()
         local_grad_shard = self.flat_buffer.reduce_full_grads_to_local_shard()
-        reduce_duration_ms = (perf_counter() - reduce_start) * 1000.0
+        reduce_duration_ms = self._trace_duration_ms(reduce_start)
         self._record_event("reduce_grad", duration_ms=reduce_duration_ms)
         self._finish_backward_with_local_grad_shard(local_grad_shard, finalize_start=finalize_start)
 
-    def _finish_backward_with_grad_bucket(self, *, finalize_start: float) -> None:
+    def _finish_backward_with_grad_bucket(self, *, finalize_start: float | None) -> None:
         if self.flat_buffer is None:
             return
-        collect_start = perf_counter()
+        trace = self.runtime_trace_enabled
+        collect_start = perf_counter() if trace else None
         grad_bucket = self.flat_buffer.collect_grad_bucket()
-        self._record_event("collect_grad_bucket", duration_ms=(perf_counter() - collect_start) * 1000.0)
+        if trace:
+            self._record_event("collect_grad_bucket", duration_ms=(perf_counter() - collect_start) * 1000.0)
         had_local_grad_shard = self.flat_buffer.local_grad_shard is not None
-        local_view_start = perf_counter()
+        local_view_start = perf_counter() if trace else None
         self.flat_buffer.use_local_shards(preserve_local_grad_shard=True)
-        self._record_event("use_local_shards:pre_reduce_grad", duration_ms=(perf_counter() - local_view_start) * 1000.0)
-        clear_start = perf_counter()
+        if trace:
+            self._record_event("use_local_shards:pre_reduce_grad", duration_ms=(perf_counter() - local_view_start) * 1000.0)
+        clear_start = perf_counter() if trace else None
         clear_stats = self.flat_buffer.clear_full_params(
             shrink_storage=self.shrink_full_param_storage_after_backward,
             keep_shrunk_tensor=False,
         )
-        self._record_event("clear_full_params:pre_reduce_grad", duration_ms=(perf_counter() - clear_start) * 1000.0)
+        if trace:
+            self._record_event("clear_full_params:pre_reduce_grad", duration_ms=(perf_counter() - clear_start) * 1000.0)
         self._record_full_param_clear_event("pre_reduce_grad", clear_stats)
         self._transition_lifecycle_state(
             FSDPLifecycleState.SHARDED,
             reason="reshard_before_reduce_grad",
             allowed_from=(FSDPLifecycleState.UNSHARDED, FSDPLifecycleState.SHARDED),
         )
-        self._record_event("reshard_before_reduce_grad")
+        if trace:
+            self._record_event("reshard_before_reduce_grad")
         self._record_full_param_buffer_snapshot("reshard_before_reduce_grad")
         if self._scheduler is not None:
-            scheduler_start = perf_counter()
+            scheduler_start = perf_counter() if trace else None
             pending_before = self._scheduler.pending_backward_reduce_count
             waits_before = self._scheduler.backward_reduce_waits
             self._scheduler.before_backward_reduce(self)
-            self._record_event(
-                "before_backward_reduce_scheduler_runtime",
-                duration_ms=(perf_counter() - scheduler_start) * 1000.0,
-            )
+            if trace:
+                self._record_event(
+                    "before_backward_reduce_scheduler_runtime",
+                    duration_ms=(perf_counter() - scheduler_start) * 1000.0,
+                )
             waited_reduces = self._scheduler.backward_reduce_waits - waits_before
-            if waited_reduces > 0 or pending_before > 0:
+            if trace and (waited_reduces > 0 or pending_before > 0):
                 self._record_event(
                     f"wait_pending_backward_reduce_before_enqueue:waited={waited_reduces}:pending_before={pending_before}"
                 )
-        reduce_start = perf_counter()
-        reduce_start_result = self.flat_buffer.start_reduce_grad_bucket_to_local_shard_with_stats(grad_bucket)
-        reduce_handle = reduce_start_result.handle
-        reduce_stats = reduce_start_result.stats
+        reduce_start = perf_counter() if trace else None
+        if trace:
+            reduce_start_result = self.flat_buffer.start_reduce_grad_bucket_to_local_shard_with_stats(grad_bucket)
+            reduce_handle = reduce_start_result.handle
+            reduce_stats = reduce_start_result.stats
+        else:
+            reduce_handle = self.flat_buffer.start_reduce_grad_bucket_to_local_shard(grad_bucket)
         self._post_backward_reduce_handle = reduce_handle
         self._post_backward_reduce_should_accumulate = had_local_grad_shard
-        self._record_event(
-            f"grad_bucket_layout:{reduce_stats.layout_kind}",
-            duration_ms=0.0,
-        )
-        if reduce_stats.needs_copy_in:
+        if trace:
             self._record_event(
-                "copy_in_grad_bucket",
-                duration_ms=reduce_stats.copy_in_ms,
-                reduce_scatter_input_bytes=reduce_stats.packed_bytes,
-                grad_bucket_workspace_kind=reduce_stats.workspace_kind,
-                grad_bucket_workspace_numel=reduce_stats.workspace_numel,
-                grad_bucket_workspace_padding_waste_numel=reduce_stats.workspace_padding_waste_numel,
-                grad_bucket_workspace_persistent=reduce_stats.workspace_persistent,
-            )
-        else:
-            self._record_event(
-                "copy_in_grad_bucket_skipped",
+                f"grad_bucket_layout:{reduce_stats.layout_kind}",
                 duration_ms=0.0,
+            )
+            if reduce_stats.needs_copy_in:
+                self._record_event(
+                    "copy_in_grad_bucket",
+                    duration_ms=reduce_stats.copy_in_ms,
+                    reduce_scatter_input_bytes=reduce_stats.packed_bytes,
+                    grad_bucket_workspace_kind=reduce_stats.workspace_kind,
+                    grad_bucket_workspace_numel=reduce_stats.workspace_numel,
+                    grad_bucket_workspace_padding_waste_numel=reduce_stats.workspace_padding_waste_numel,
+                    grad_bucket_workspace_persistent=reduce_stats.workspace_persistent,
+                )
+            else:
+                self._record_event(
+                    "copy_in_grad_bucket_skipped",
+                    duration_ms=0.0,
+                    reduce_scatter_input_bytes=reduce_stats.packed_bytes,
+                    grad_bucket_workspace_kind=reduce_stats.workspace_kind,
+                    grad_bucket_workspace_numel=reduce_stats.workspace_numel,
+                    grad_bucket_workspace_padding_waste_numel=reduce_stats.workspace_padding_waste_numel,
+                    grad_bucket_workspace_persistent=reduce_stats.workspace_persistent,
+                )
+            self._record_event(
+                "enqueue_reduce_scatter_grad_bucket",
+                duration_ms=reduce_stats.reduce_scatter_enqueue_ms,
                 reduce_scatter_input_bytes=reduce_stats.packed_bytes,
+                collective_handle=reduce_handle,
                 grad_bucket_workspace_kind=reduce_stats.workspace_kind,
                 grad_bucket_workspace_numel=reduce_stats.workspace_numel,
                 grad_bucket_workspace_padding_waste_numel=reduce_stats.workspace_padding_waste_numel,
                 grad_bucket_workspace_persistent=reduce_stats.workspace_persistent,
             )
-        self._record_event(
-            "enqueue_reduce_scatter_grad_bucket",
-            duration_ms=reduce_stats.reduce_scatter_enqueue_ms,
-            reduce_scatter_input_bytes=reduce_stats.packed_bytes,
-            collective_handle=reduce_handle,
-            grad_bucket_workspace_kind=reduce_stats.workspace_kind,
-            grad_bucket_workspace_numel=reduce_stats.workspace_numel,
-            grad_bucket_workspace_padding_waste_numel=reduce_stats.workspace_padding_waste_numel,
-            grad_bucket_workspace_persistent=reduce_stats.workspace_persistent,
-        )
-        self._record_event("start_reduce_grad_bucket", duration_ms=(perf_counter() - reduce_start) * 1000.0)
+            self._record_event("start_reduce_grad_bucket", duration_ms=(perf_counter() - reduce_start) * 1000.0)
         local_grad_shard = reduce_handle.tensor
-        self._record_event("reduce_grad_bucket", duration_ms=(perf_counter() - reduce_start) * 1000.0)
+        if trace:
+            self._record_event("reduce_grad_bucket", duration_ms=(perf_counter() - reduce_start) * 1000.0)
         if not had_local_grad_shard:
             self.flat_buffer.use_local_grad_shard(local_grad_shard)
         if not self.finalize_after_backward_enabled:
             self.wait_post_backward_reduce()
         elif self._scheduler is not None:
-            scheduler_start = perf_counter()
+            scheduler_start = perf_counter() if trace else None
             pending_before = self._scheduler.pending_backward_reduce_count
             waits_before = self._scheduler.backward_reduce_waits
             self._scheduler.after_backward_reduce_started(self)
-            self._record_event(
-                "after_backward_reduce_started_scheduler_runtime",
-                duration_ms=(perf_counter() - scheduler_start) * 1000.0,
-            )
+            if trace:
+                self._record_event(
+                    "after_backward_reduce_started_scheduler_runtime",
+                    duration_ms=(perf_counter() - scheduler_start) * 1000.0,
+                )
             waited_reduces = self._scheduler.backward_reduce_waits - waits_before
-            if waited_reduces > 0 or pending_before > 0:
+            if trace and (waited_reduces > 0 or pending_before > 0):
                 self._record_event(
                     f"wait_pending_backward_reduce_after_enqueue:waited={waited_reduces}:pending_before={pending_before}"
                 )
-            self._record_event("pending_backward_reduce")
-            scheduler_start = perf_counter()
+            if trace:
+                self._record_event("pending_backward_reduce")
+            scheduler_start = perf_counter() if trace else None
             self._scheduler.on_post_backward_reshard(self)
-            self._record_event(
-                "post_backward_reshard_scheduler_runtime",
-                duration_ms=(perf_counter() - scheduler_start) * 1000.0,
-            )
+            if trace:
+                self._record_event(
+                    "post_backward_reshard_scheduler_runtime",
+                    duration_ms=(perf_counter() - scheduler_start) * 1000.0,
+                )
         else:
             self.wait_post_backward_reduce()
         self._finish_backward_common(finalize_start=finalize_start)
@@ -615,53 +646,64 @@ class MatrixFSDPParamGroup:
         if self.flat_buffer is None or self._post_backward_reduce_handle is None:
             return
         reduce_handle = self._post_backward_reduce_handle
-        wait_start = perf_counter()
+        trace = self.runtime_trace_enabled
+        wait_start = perf_counter() if trace else None
         local_grad_shard = reduce_handle.wait()
-        wait_duration_ms = (perf_counter() - wait_start) * 1000.0
-        self._record_event(
-            "wait_reduce_grad_bucket_handle",
-            duration_ms=wait_duration_ms,
-            collective_handle=reduce_handle,
-        )
+        if trace:
+            wait_duration_ms = (perf_counter() - wait_start) * 1000.0
+            self._record_event(
+                "wait_reduce_grad_bucket_handle",
+                duration_ms=wait_duration_ms,
+                collective_handle=reduce_handle,
+            )
         self._post_backward_reduce_handle = None
         should_accumulate = self._post_backward_reduce_should_accumulate
         self._post_backward_reduce_should_accumulate = False
         self._validate_lifecycle_invariants("wait_post_backward_reduce")
-        materialize_start = perf_counter()
+        materialize_start = perf_counter() if trace else None
         if should_accumulate:
             accumulated = self.flat_buffer.accumulate_local_grad_shard(local_grad_shard)
-            if accumulated:
+            if trace and accumulated:
                 self._record_event("accumulate_local_grad_shard")
-        self._record_event(
-            "materialize_reduced_local_grad_shard",
-            duration_ms=(perf_counter() - materialize_start) * 1000.0,
-        )
-        self._record_event("wait_reduce_grad_bucket", duration_ms=wait_duration_ms)
-        self._record_event(
-            "wait_reduce_scatter_collective",
-            duration_ms=wait_duration_ms,
-            collective_handle=reduce_handle,
-        )
+        if trace:
+            self._record_event(
+                "materialize_reduced_local_grad_shard",
+                duration_ms=(perf_counter() - materialize_start) * 1000.0,
+            )
+            self._record_event("wait_reduce_grad_bucket", duration_ms=wait_duration_ms)
+            self._record_event(
+                "wait_reduce_scatter_collective",
+                duration_ms=wait_duration_ms,
+                collective_handle=reduce_handle,
+            )
 
-    def _finish_backward_with_local_grad_shard(self, local_grad_shard: torch.Tensor, *, finalize_start: float) -> None:
+    def _finish_backward_with_local_grad_shard(
+        self,
+        local_grad_shard: torch.Tensor,
+        *,
+        finalize_start: float | None,
+    ) -> None:
         if self.flat_buffer is None:
             return
-        local_view_start = perf_counter()
+        trace = self.runtime_trace_enabled
+        local_view_start = perf_counter() if trace else None
         self.flat_buffer.use_local_shards(preserve_local_grad_shard=True)
-        self._record_event("use_local_shards:finish_backward", duration_ms=(perf_counter() - local_view_start) * 1000.0)
+        if trace:
+            self._record_event("use_local_shards:finish_backward", duration_ms=(perf_counter() - local_view_start) * 1000.0)
         accumulated = self.flat_buffer.accumulate_local_grad_shard(local_grad_shard)
-        if accumulated:
+        if trace and accumulated:
             self._record_event("accumulate_local_grad_shard")
-        clear_start = perf_counter()
+        clear_start = perf_counter() if trace else None
         clear_stats = self.flat_buffer.clear_full_params(
             shrink_storage=self.shrink_full_param_storage_after_backward,
             keep_shrunk_tensor=False,
         )
-        self._record_event("clear_full_params:finish_backward", duration_ms=(perf_counter() - clear_start) * 1000.0)
+        if trace:
+            self._record_event("clear_full_params:finish_backward", duration_ms=(perf_counter() - clear_start) * 1000.0)
         self._record_full_param_clear_event("finish_backward", clear_stats)
         self._finish_backward_common(finalize_start=finalize_start)
 
-    def _finish_backward_common(self, *, finalize_start: float) -> None:
+    def _finish_backward_common(self, *, finalize_start: float | None) -> None:
         self._transition_lifecycle_state(
             FSDPLifecycleState.SHARDED,
             reason="finish_backward",
@@ -669,6 +711,7 @@ class MatrixFSDPParamGroup:
         )
         self._pending_backward_context = None
         self._post_backward_seen_param_ids.clear()
+        self._post_backward_seen_count = 0
         self._checkpoint_recompute_forward_depth = 0
         self._defer_backward_reduce = False
         self._forward_prefetched = False
@@ -677,25 +720,26 @@ class MatrixFSDPParamGroup:
         self._unshard_handle = None
         if self.finalize_after_backward_enabled:
             self._finalized_after_backward = True
-        self._record_event("finalize_backward", duration_ms=(perf_counter() - finalize_start) * 1000.0)
+        if self.runtime_trace_enabled:
+            self._record_event("finalize_backward", duration_ms=(perf_counter() - finalize_start) * 1000.0)
 
     def _finalize_deferred_backward_from_sharded(self) -> None:
         if self.flat_buffer is None:
             return
-        finalize_start = perf_counter()
+        finalize_start = self._trace_start()
         if self.backward_reduce_strategy == "bucket_reduce_scatter":
             self._finish_backward_with_grad_bucket(finalize_start=finalize_start)
             return
-        reduce_start = perf_counter()
+        reduce_start = self._trace_start()
         local_grad_shard = self.flat_buffer.reduce_full_grads_to_local_shard()
-        self._record_event("reduce_grad", duration_ms=(perf_counter() - reduce_start) * 1000.0)
+        self._record_event("reduce_grad", duration_ms=self._trace_duration_ms(reduce_start))
         self._finish_backward_with_local_grad_shard(local_grad_shard, finalize_start=finalize_start)
 
     def _reshard_after_deferred_no_sync_backward(self) -> None:
         if self.flat_buffer is None or self.lifecycle_state != FSDPLifecycleState.UNSHARDED:
             return
-        reshard_start = perf_counter()
-        local_view_start = perf_counter()
+        reshard_start = self._trace_start()
+        local_view_start = self._trace_start()
         self.flat_buffer.use_local_shards(
             preserve_full_grad_buffer=True,
             preserve_grad_bucket_input=True,
@@ -703,16 +747,16 @@ class MatrixFSDPParamGroup:
         )
         self._record_event(
             "use_local_shards:no_sync_backward",
-            duration_ms=(perf_counter() - local_view_start) * 1000.0,
+            duration_ms=self._trace_duration_ms(local_view_start),
         )
-        clear_start = perf_counter()
+        clear_start = self._trace_start()
         clear_stats = self.flat_buffer.clear_full_params(
             shrink_storage=self.shrink_full_param_storage_after_backward,
             keep_shrunk_tensor=False,
         )
         self._record_event(
             "clear_full_params:no_sync_backward",
-            duration_ms=(perf_counter() - clear_start) * 1000.0,
+            duration_ms=self._trace_duration_ms(clear_start),
         )
         self._record_full_param_clear_event("no_sync_backward", clear_stats)
         self._transition_lifecycle_state(
@@ -726,7 +770,7 @@ class MatrixFSDPParamGroup:
         self._backward_prefetched = False
         self._unshard_inflight = False
         self._unshard_handle = None
-        self._record_event("reshard_after_no_sync_backward", duration_ms=(perf_counter() - reshard_start) * 1000.0)
+        self._record_event("reshard_after_no_sync_backward", duration_ms=self._trace_duration_ms(reshard_start))
         self._record_full_param_buffer_snapshot("reshard_after_no_sync_backward")
 
     def state_dict(self) -> dict[str, object]:
@@ -903,6 +947,7 @@ class MatrixFSDPParamGroup:
     def reset_grad_accumulation(self) -> None:
         self._defer_backward_reduce = False
         self._post_backward_seen_param_ids.clear()
+        self._post_backward_seen_count = 0
 
     def set_scheduler(self, scheduler: MatrixFSDPScheduler | None) -> None:
         self._scheduler = scheduler
@@ -965,24 +1010,38 @@ class MatrixFSDPParamGroup:
             validate_owner_collective_signature=validate_owner_collective_signature,
         )
 
+    def discard_unconsumed_prefetch(self, reason: str = "unused_prefetch") -> bool:
+        if self.flat_buffer is None or self.lifecycle_state != FSDPLifecycleState.UNSHARDED:
+            return False
+        if not (self._forward_prefetched or self._backward_prefetched or self._unshard_inflight):
+            return False
+        self.wait_unshard(reason)
+        self.reshard_after_forward(needs_pre_backward_unshard=False)
+        self._forward_prefetched = False
+        self._backward_prefetched = False
+        return True
+
     def _pre_forward(
         self,
         module: nn.Module,
         args: tuple[object, ...],
         kwargs: dict[str, object],
     ) -> tuple[tuple[object, ...], dict[str, object]]:
-        pre_forward_start = perf_counter()
+        trace = self.runtime_trace_enabled
+        pre_forward_start = perf_counter() if trace else None
         in_backward_graph_task = _is_in_backward_graph_task()
         if not in_backward_graph_task and self._checkpoint_recompute_forward_depth > 0:
             self._checkpoint_recompute_forward_depth = 0
-            self._record_event("checkpoint_recompute_depth_reset")
+            if trace:
+                self._record_event("checkpoint_recompute_depth_reset")
         if (
             self.reshard_after_forward_enabled
             and in_backward_graph_task
             and self.lifecycle_state == FSDPLifecycleState.UNSHARDED
         ):
             self._checkpoint_recompute_forward_depth += 1
-            self._record_event("checkpoint_recompute_pre_forward")
+            if trace:
+                self._record_event("checkpoint_recompute_pre_forward")
             return args, kwargs
         if self._pending_backward_context is not None and self._pending_backward_context.pending_backward:
             raise RuntimeError(
@@ -1007,50 +1066,59 @@ class MatrixFSDPParamGroup:
                 "before running another forward."
             )
         self._post_backward_seen_param_ids.clear()
+        self._post_backward_seen_count = 0
         self._finalized_after_backward = False
         self._forward_prefetched = False
         self._backward_prefetched = False
-        self._record_event("pre_forward")
-        pre_forward_unshard_start = perf_counter()
+        if trace:
+            self._record_event("pre_forward")
+        pre_forward_unshard_start = perf_counter() if trace else None
         self.start_unshard("pre_forward")
-        self._record_event(
-            "pre_forward_start_unshard_runtime",
-            duration_ms=(perf_counter() - pre_forward_unshard_start) * 1000.0,
-        )
-        pre_forward_wait_start = perf_counter()
-        self.wait_unshard("pre_forward")
-        self._record_event(
-            "pre_forward_wait_unshard_runtime",
-            duration_ms=(perf_counter() - pre_forward_wait_start) * 1000.0,
-        )
-        prefetch_start = perf_counter()
-        self._prefetch_next_forward()
-        self._record_event(
-            "pre_forward_prefetch_next_runtime",
-            duration_ms=(perf_counter() - prefetch_start) * 1000.0,
-        )
-        if torch.is_grad_enabled() and not self.reshard_after_forward_enabled:
-            prepare_start = perf_counter()
-            self._prepare_backward_grad_storage()
+        if trace:
             self._record_event(
-                "pre_forward_prepare_backward_grad_storage_runtime",
-                duration_ms=(perf_counter() - prepare_start) * 1000.0,
+                "pre_forward_start_unshard_runtime",
+                duration_ms=(perf_counter() - pre_forward_unshard_start) * 1000.0,
             )
+        pre_forward_wait_start = perf_counter() if trace else None
+        self.wait_unshard("pre_forward")
+        if trace:
+            self._record_event(
+                "pre_forward_wait_unshard_runtime",
+                duration_ms=(perf_counter() - pre_forward_wait_start) * 1000.0,
+            )
+        prefetch_start = perf_counter() if trace else None
+        self._prefetch_next_forward()
+        if trace:
+            self._record_event(
+                "pre_forward_prefetch_next_runtime",
+                duration_ms=(perf_counter() - prefetch_start) * 1000.0,
+            )
+        if torch.is_grad_enabled() and not self.reshard_after_forward_enabled:
+            prepare_start = perf_counter() if trace else None
+            self._prepare_backward_grad_storage()
+            if trace:
+                self._record_event(
+                    "pre_forward_prepare_backward_grad_storage_runtime",
+                    duration_ms=(perf_counter() - prepare_start) * 1000.0,
+                )
         if self.reshard_after_forward_enabled and torch.is_grad_enabled():
             self._active_backward_context = ForwardBackwardContext(self._pre_backward_unshard)
             if self.use_saved_tensor_hooks:
-                hook_start = perf_counter()
+                hook_start = perf_counter() if trace else None
                 self._enter_saved_tensors_hooks()
-                self._record_event(
-                    "pre_forward_enter_saved_tensors_hooks_runtime",
-                    duration_ms=(perf_counter() - hook_start) * 1000.0,
-                )
+                if trace:
+                    self._record_event(
+                        "pre_forward_enter_saved_tensors_hooks_runtime",
+                        duration_ms=(perf_counter() - hook_start) * 1000.0,
+                    )
         if self.cast_forward_inputs and self.param_dtype is not None:
-            cast_start = perf_counter()
+            cast_start = perf_counter() if trace else None
             args = cast_floating_tensors(args, self.param_dtype)
             kwargs = cast_floating_tensors(kwargs, self.param_dtype)
-            self._record_event("cast_forward_inputs", duration_ms=(perf_counter() - cast_start) * 1000.0)
-        self._record_event("pre_forward_runtime", duration_ms=(perf_counter() - pre_forward_start) * 1000.0)
+            if trace:
+                self._record_event("cast_forward_inputs", duration_ms=(perf_counter() - cast_start) * 1000.0)
+        if trace:
+            self._record_event("pre_forward_runtime", duration_ms=(perf_counter() - pre_forward_start) * 1000.0)
         return args, kwargs
 
     def _post_forward(
@@ -1060,30 +1128,37 @@ class MatrixFSDPParamGroup:
         kwargs: dict[str, object],
         output: object,
     ) -> object:
-        post_forward_start = perf_counter()
+        trace = self.runtime_trace_enabled
+        post_forward_start = perf_counter() if trace else None
         if self._checkpoint_recompute_forward_depth > 0 and _is_in_backward_graph_task():
             self._checkpoint_recompute_forward_depth -= 1
-            self._record_event("checkpoint_recompute_post_forward")
+            if trace:
+                self._record_event("checkpoint_recompute_post_forward")
             output = self._cast_forward_output(output)
-            self._record_event("post_forward_runtime", duration_ms=(perf_counter() - post_forward_start) * 1000.0)
+            if trace:
+                self._record_event("post_forward_runtime", duration_ms=(perf_counter() - post_forward_start) * 1000.0)
             return output
         if self._checkpoint_recompute_forward_depth > 0:
             self._checkpoint_recompute_forward_depth = 0
-            self._record_event("checkpoint_recompute_depth_reset")
+            if trace:
+                self._record_event("checkpoint_recompute_depth_reset")
         if not self.reshard_after_forward_enabled:
             output = self._cast_forward_output(output)
-            self._record_event("post_forward_runtime", duration_ms=(perf_counter() - post_forward_start) * 1000.0)
+            if trace:
+                self._record_event("post_forward_runtime", duration_ms=(perf_counter() - post_forward_start) * 1000.0)
             return output
-        saved_hooks_start = perf_counter()
+        saved_hooks_start = perf_counter() if trace else None
         self._exit_saved_tensors_hooks()
-        self._record_event("exit_saved_tensors_hooks", duration_ms=(perf_counter() - saved_hooks_start) * 1000.0)
+        if trace:
+            self._record_event("exit_saved_tensors_hooks", duration_ms=(perf_counter() - saved_hooks_start) * 1000.0)
         context = self._active_backward_context
         if torch.is_grad_enabled():
             if context is None:
                 context = ForwardBackwardContext(self._pre_backward_unshard)
-            hook_start = perf_counter()
+            hook_start = perf_counter() if trace else None
             registered_hooks = register_pre_backward_hooks_with_context(output, context)
-            self._record_event("register_pre_backward_hooks", duration_ms=(perf_counter() - hook_start) * 1000.0)
+            if trace:
+                self._record_event("register_pre_backward_hooks", duration_ms=(perf_counter() - hook_start) * 1000.0)
             context.mark_registered(registered_hooks)
         else:
             registered_hooks = 0
@@ -1093,47 +1168,56 @@ class MatrixFSDPParamGroup:
         if registered_hooks > 0 and self._scheduler is not None:
             self._scheduler.record_post_forward(self)
         output = self._cast_forward_output(output)
-        self._record_event("post_forward_runtime", duration_ms=(perf_counter() - post_forward_start) * 1000.0)
+        if trace:
+            self._record_event("post_forward_runtime", duration_ms=(perf_counter() - post_forward_start) * 1000.0)
         return output
 
     def _cast_forward_output(self, output: object) -> object:
         if self.output_dtype is None:
             return output
-        cast_start = perf_counter()
+        trace = self.runtime_trace_enabled
+        cast_start = perf_counter() if trace else None
         cast_output = cast_floating_tensors(output, self.output_dtype)
-        self._record_event("cast_forward_output", duration_ms=(perf_counter() - cast_start) * 1000.0)
+        if trace:
+            self._record_event("cast_forward_output", duration_ms=(perf_counter() - cast_start) * 1000.0)
         return cast_output
 
     def _pre_backward_unshard(self) -> None:
-        pre_backward_start = perf_counter()
-        self._record_event("pre_backward_unshard")
-        pre_backward_unshard_start = perf_counter()
+        trace = self.runtime_trace_enabled
+        pre_backward_start = perf_counter() if trace else None
+        if trace:
+            self._record_event("pre_backward_unshard")
+        pre_backward_unshard_start = perf_counter() if trace else None
         self.start_unshard("pre_backward")
-        self._record_event(
-            "pre_backward_start_unshard_runtime",
-            duration_ms=(perf_counter() - pre_backward_unshard_start) * 1000.0,
-        )
-        pre_backward_wait_start = perf_counter()
+        if trace:
+            self._record_event(
+                "pre_backward_start_unshard_runtime",
+                duration_ms=(perf_counter() - pre_backward_unshard_start) * 1000.0,
+            )
+        pre_backward_wait_start = perf_counter() if trace else None
         self.wait_unshard("pre_backward")
-        self._record_event(
-            "pre_backward_wait_unshard_runtime",
-            duration_ms=(perf_counter() - pre_backward_wait_start) * 1000.0,
-        )
+        if trace:
+            self._record_event(
+                "pre_backward_wait_unshard_runtime",
+                duration_ms=(perf_counter() - pre_backward_wait_start) * 1000.0,
+            )
         self._backward_prefetched = False
         if self._scheduler is not None:
-            scheduler_start = perf_counter()
+            scheduler_start = perf_counter() if trace else None
             self._scheduler.on_pre_backward(self)
-            self._record_event(
-                "pre_backward_scheduler_runtime",
-                duration_ms=(perf_counter() - scheduler_start) * 1000.0,
-            )
-        prepare_start = perf_counter()
+            if trace:
+                self._record_event(
+                    "pre_backward_scheduler_runtime",
+                    duration_ms=(perf_counter() - scheduler_start) * 1000.0,
+                )
+        prepare_start = perf_counter() if trace else None
         self._prepare_backward_grad_storage()
-        self._record_event(
-            "pre_backward_prepare_grad_storage_runtime",
-            duration_ms=(perf_counter() - prepare_start) * 1000.0,
-        )
-        self._record_event("pre_backward_unshard_runtime", duration_ms=(perf_counter() - pre_backward_start) * 1000.0)
+        if trace:
+            self._record_event(
+                "pre_backward_prepare_grad_storage_runtime",
+                duration_ms=(perf_counter() - prepare_start) * 1000.0,
+            )
+            self._record_event("pre_backward_unshard_runtime", duration_ms=(perf_counter() - pre_backward_start) * 1000.0)
 
     def _prepare_backward_grad_storage(self) -> None:
         if self._no_sync_depth > 0:
@@ -1149,33 +1233,33 @@ class MatrixFSDPParamGroup:
     def _prepare_full_grad_buffer(self) -> None:
         if self.flat_buffer is None:
             return
-        prepare_start = perf_counter()
+        prepare_start = self._trace_start()
         reused = self.flat_buffer.prepare_full_grad_buffer(accumulate=self._defer_backward_reduce)
         if reused:
             self._record_event(
                 "reuse_full_grad_buffer_for_accumulation",
-                duration_ms=(perf_counter() - prepare_start) * 1000.0,
+                duration_ms=self._trace_duration_ms(prepare_start),
             )
             return
-        self._record_event("prepare_full_grad_buffer", duration_ms=(perf_counter() - prepare_start) * 1000.0)
+        self._record_event("prepare_full_grad_buffer", duration_ms=self._trace_duration_ms(prepare_start))
 
     def _prepare_local_grad_accumulator(self) -> None:
         if self.flat_buffer is None:
             return
-        prepare_start = perf_counter()
+        prepare_start = self._trace_start()
         self.flat_buffer.prepare_local_grad_accumulator()
-        self._record_event("prepare_local_grad_accumulator", duration_ms=(perf_counter() - prepare_start) * 1000.0)
+        self._record_event("prepare_local_grad_accumulator", duration_ms=self._trace_duration_ms(prepare_start))
 
     def _prepare_grad_bucket(self) -> None:
         if self.flat_buffer is None:
             return
         had_accumulated_bucket = self._defer_backward_reduce and self.flat_buffer.grad_bucket_input is not None
-        prepare_start = perf_counter()
+        prepare_start = self._trace_start()
         zero_copy = self.flat_buffer.prepare_grad_bucket(
             zero_copy=self.use_zero_copy_grad_bucket,
             accumulate=self._defer_backward_reduce,
         )
-        prepare_duration_ms = (perf_counter() - prepare_start) * 1000.0
+        prepare_duration_ms = self._trace_duration_ms(prepare_start)
         self._grad_bucket_prepared_zero_copy = zero_copy
         self._record_event("prepare_grad_bucket", duration_ms=prepare_duration_ms)
         if zero_copy and had_accumulated_bucket:
@@ -1193,9 +1277,9 @@ class MatrixFSDPParamGroup:
             or not self._defer_backward_reduce
         ):
             return
-        copy_start = perf_counter()
+        copy_start = self._trace_start()
         accumulated = self.flat_buffer.accumulate_grad_bucket_input_from_param_grads()
-        self._record_event("copy_in_grad_bucket_for_accumulation", duration_ms=(perf_counter() - copy_start) * 1000.0)
+        self._record_event("copy_in_grad_bucket_for_accumulation", duration_ms=self._trace_duration_ms(copy_start))
         if accumulated:
             self._record_event("reuse_grad_bucket_for_accumulation")
 
@@ -1207,21 +1291,21 @@ class MatrixFSDPParamGroup:
     def _enter_saved_tensors_hooks(self) -> None:
         if self._saved_tensors_hooks_context is not None:
             raise RuntimeError("Saved tensor hooks are already active for this MatrixFSDP param group.")
-        hook_start = perf_counter()
+        hook_start = self._trace_start()
         self._saved_tensors_hooks_context = torch.autograd.graph.saved_tensors_hooks(
             self._pack_saved_tensor,
             self._unpack_saved_tensor,
         )
         self._saved_tensors_hooks_context.__enter__()
-        self._record_event("enter_saved_tensors_hooks", duration_ms=(perf_counter() - hook_start) * 1000.0)
+        self._record_event("enter_saved_tensors_hooks", duration_ms=self._trace_duration_ms(hook_start))
 
     def _exit_saved_tensors_hooks(self) -> None:
         if self._saved_tensors_hooks_context is None:
             return
-        hook_start = perf_counter()
+        hook_start = self._trace_start()
         self._saved_tensors_hooks_context.__exit__(None, None, None)
         self._saved_tensors_hooks_context = None
-        self._record_event("exit_saved_tensors_hooks_active", duration_ms=(perf_counter() - hook_start) * 1000.0)
+        self._record_event("exit_saved_tensors_hooks_active", duration_ms=self._trace_duration_ms(hook_start))
 
     def _pack_saved_tensor(self, tensor: torch.Tensor) -> torch.Tensor | _SavedFullParamView:
         if self.flat_buffer is None or self.flat_buffer.full_buffer is None:
@@ -1265,13 +1349,19 @@ class MatrixFSDPParamGroup:
             param_by_id[id(param)] = mp
             self._handles.append(param.register_post_accumulate_grad_hook(self._post_accumulate_grad))
         self._post_backward_expected_param_ids = expected_param_ids
+        self._post_backward_expected_count = len(expected_param_ids)
         self._post_backward_param_by_id = param_by_id
 
     def _post_accumulate_grad(self, param: torch.Tensor) -> None:
         if self.backward_reduce_strategy in ("per_param", "per_param_allreduce"):
             self._reduce_post_accumulated_param_grad(param)
-        self._post_backward_seen_param_ids.add(id(param))
-        if self._post_backward_seen_param_ids != self._post_backward_expected_param_ids:
+        param_id = id(param)
+        if param_id not in self._post_backward_expected_param_ids:
+            return
+        if param_id not in self._post_backward_seen_param_ids:
+            self._post_backward_seen_param_ids.add(param_id)
+            self._post_backward_seen_count += 1
+        if self._post_backward_seen_count != self._post_backward_expected_count:
             return
         if self._no_sync_depth > 0:
             self._defer_backward_reduce = True
@@ -1309,12 +1399,12 @@ class MatrixFSDPParamGroup:
         managed_param = self._post_backward_param_by_id.get(id(param))
         if managed_param is None:
             return
-        reduce_start = perf_counter()
+        reduce_start = self._trace_start()
         if self.backward_reduce_strategy == "per_param_allreduce":
             self.flat_buffer.all_reduce_param_grad_to_local_accumulator(managed_param)
         else:
             self.flat_buffer.reduce_param_grad_to_local_accumulator(managed_param)
-        self._record_event(f"reduce_param_grad:{managed_param.fqn}", duration_ms=(perf_counter() - reduce_start) * 1000.0)
+        self._record_event(f"reduce_param_grad:{managed_param.fqn}", duration_ms=self._trace_duration_ms(reduce_start))
 
     def _record_event(
         self,
@@ -1375,12 +1465,20 @@ class MatrixFSDPParamGroup:
         )
 
     def _record_full_param_clear_event(self, phase: str, clear_stats) -> None:
+        if not self.runtime_trace_enabled:
+            return
         kind = getattr(clear_stats, "kind", "unknown")
         self._record_event(f"full_param_buffer_clear:{phase}:{kind}")
 
     def _record_full_param_buffer_snapshot(self, reason: str) -> None:
         if self.runtime_trace_enabled and self._scheduler is not None:
             self._scheduler.record_full_param_buffer_snapshot(reason)
+
+    def _trace_start(self) -> float | None:
+        return perf_counter() if self.runtime_trace_enabled else None
+
+    def _trace_duration_ms(self, start: float | None) -> float | None:
+        return None if start is None else (perf_counter() - start) * 1000.0
 
     def _runtime_memory_snapshot(self, reason: str, *, reduce_scatter_input_bytes: int = 0) -> dict[str, int | str | bool]:
         if self._scheduler is not None:

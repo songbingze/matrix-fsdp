@@ -184,6 +184,9 @@ class MatrixFSDPScheduler:
         self._post_forward_order: list[MatrixFSDPParamGroup] = []
         self._post_forward_indices_by_unit_id: dict[int, list[int]] = {}
         self._index_by_unit_id = {id(unit): index for index, unit in enumerate(self.units)}
+        self._unit_by_id = {id(unit): unit for unit in self.units}
+        self._forward_prefetched_unit_ids: set[int] = set()
+        self._backward_prefetched_unit_ids: set[int] = set()
         self._owner_forward_prefetch_next_index = 1
         self._owner_backward_prefetch_next_post_forward_index: int | None = None
         self._owner_ordered_prefetch_issued_since_sync = False
@@ -218,6 +221,8 @@ class MatrixFSDPScheduler:
         post_forward_index = len(self._post_forward_order)
         self._post_forward_order.append(unit)
         self._post_forward_indices_by_unit_id.setdefault(id(unit), []).append(post_forward_index)
+        if _is_in_backward_graph_task():
+            return
         self._prefetch_forward_after_post_forward(unit)
 
     def on_pre_forward(self, unit: MatrixFSDPParamGroup) -> None:
@@ -234,7 +239,7 @@ class MatrixFSDPScheduler:
         # lookahead window. Real param groups clear this flag in their hook;
         # keeping the scheduler entry idempotent makes direct scheduler tests
         # and custom callers observe the same budget semantics.
-        unit._forward_prefetched = False
+        self._mark_forward_prefetch_consumed(unit)
         target = self.next_forward_unit(unit)
         if target is None:
             return
@@ -246,7 +251,7 @@ class MatrixFSDPScheduler:
     def on_pre_backward(self, unit: MatrixFSDPParamGroup) -> None:
         if self.backward_prefetch_timing != "pre_backward":
             return
-        unit._backward_prefetched = False
+        self._mark_backward_prefetch_consumed(unit)
         self._prefetch_previous_backward_unit(unit)
 
     def on_post_backward_reshard(self, unit: MatrixFSDPParamGroup) -> None:
@@ -311,6 +316,7 @@ class MatrixFSDPScheduler:
                 self._record_owner_prefetch_queue_skip(target, "forward", next_index - 1, next_index - 1, reason="memory_cap")
                 return
             if target.prefetch_forward():
+                self._mark_forward_prefetched(target)
                 self.forward_prefetch_issued += 1
                 issued = True
 
@@ -386,6 +392,7 @@ class MatrixFSDPScheduler:
             validate_owner_collective_signature=True,
             ordered_owner_collective=True,
         ):
+            self._mark_forward_prefetched(target)
             self.forward_prefetch_issued += 1
             self._owner_ordered_prefetch_issued_since_sync = True
             self._owner_forward_prefetch_next_index += 1
@@ -518,6 +525,7 @@ class MatrixFSDPScheduler:
             validate_owner_collective_signature=validate_owner_collective_signature,
             ordered_owner_collective=ordered_owner_collective,
         ):
+            self._mark_backward_prefetched(target)
             self.backward_prefetch_issued += 1
             return True
         return False
@@ -551,6 +559,8 @@ class MatrixFSDPScheduler:
         self._synchronize_ordered_owner_prefetch_epoch()
         self._post_forward_order.clear()
         self._post_forward_indices_by_unit_id.clear()
+        self._forward_prefetched_unit_ids.clear()
+        self._backward_prefetched_unit_ids.clear()
         self._owner_backward_post_forward_order_consistent = None
         self._reset_ordered_prefetch_queues_for_forward()
 
@@ -602,16 +612,50 @@ class MatrixFSDPScheduler:
             return False
         if self.max_forward_prefetch_units is None:
             return True
-        forward_prefetched_units = sum(1 for unit in self.units if getattr(unit, "_forward_prefetched", False))
-        return forward_prefetched_units < self.max_forward_prefetch_units
+        self._prune_forward_prefetch_budget_entries()
+        return len(self._forward_prefetched_unit_ids) < self.max_forward_prefetch_units
 
     def _has_backward_prefetch_budget(self) -> bool:
         if self.max_backward_prefetch_units == 0:
             return False
         if self.max_backward_prefetch_units is None:
             return True
-        backward_prefetched_units = sum(1 for unit in self.units if getattr(unit, "_backward_prefetched", False))
-        return backward_prefetched_units < self.max_backward_prefetch_units
+        self._prune_backward_prefetch_budget_entries()
+        return len(self._backward_prefetched_unit_ids) < self.max_backward_prefetch_units
+
+    def _mark_forward_prefetched(self, unit: MatrixFSDPParamGroup) -> None:
+        if getattr(unit, "_forward_prefetched", False):
+            self._forward_prefetched_unit_ids.add(id(unit))
+
+    def _mark_backward_prefetched(self, unit: MatrixFSDPParamGroup) -> None:
+        if getattr(unit, "_backward_prefetched", False):
+            self._backward_prefetched_unit_ids.add(id(unit))
+
+    def _mark_forward_prefetch_consumed(self, unit: MatrixFSDPParamGroup) -> None:
+        unit._forward_prefetched = False
+        self._forward_prefetched_unit_ids.discard(id(unit))
+
+    def _mark_backward_prefetch_consumed(self, unit: MatrixFSDPParamGroup) -> None:
+        unit._backward_prefetched = False
+        self._backward_prefetched_unit_ids.discard(id(unit))
+
+    def _prune_forward_prefetch_budget_entries(self) -> None:
+        if not self._forward_prefetched_unit_ids:
+            return
+        self._forward_prefetched_unit_ids = {
+            unit_id
+            for unit_id in self._forward_prefetched_unit_ids
+            if getattr(self._unit_by_id[unit_id], "_forward_prefetched", False)
+        }
+
+    def _prune_backward_prefetch_budget_entries(self) -> None:
+        if not self._backward_prefetched_unit_ids:
+            return
+        self._backward_prefetched_unit_ids = {
+            unit_id
+            for unit_id in self._backward_prefetched_unit_ids
+            if getattr(self._unit_by_id[unit_id], "_backward_prefetched", False)
+        }
 
     def _has_full_param_buffer_budget_for_prefetch(self, target: MatrixFSDPParamGroup) -> bool:
         if (
