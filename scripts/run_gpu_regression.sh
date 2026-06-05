@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 PYTHON_BIN="${PYTHON:-python}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
@@ -48,6 +49,7 @@ RUN_MUON="${RUN_MUON:-1}"
 
 CUSTOM_ALLGATHERV_IMPL="${MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL:-auto}"
 CUSTOM_REDUCE_SCATTERV_IMPL="${MATRIX_FSDP_CUSTOM_REDUCE_SCATTERV_IMPL:-native_reduce}"
+MATRIX_WORKSPACE_CACHE_PER_KEY="${MATRIX_WORKSPACE_CACHE_PER_KEY:-1}"
 
 mkdir -p "$OUT_DIR"
 
@@ -66,6 +68,7 @@ Environment overrides:
   RUN_CORRECTNESS=1 RUN_FULLY_SHARD_API=1 RUN_ADAMW=1 RUN_MUON=1
   MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL=auto
   MATRIX_FSDP_CUSTOM_REDUCE_SCATTERV_IMPL=native_reduce
+  MATRIX_WORKSPACE_CACHE_PER_KEY=1
 
 Outputs:
   benchmark_results/gpu_regression_<timestamp>/*.log
@@ -100,6 +103,7 @@ log_header() {
     echo "use_checkpoint_wrapper=$USE_CHECKPOINT_WRAPPER"
     echo "custom_allgatherv_impl=$CUSTOM_ALLGATHERV_IMPL"
     echo "custom_reduce_scatterv_impl=$CUSTOM_REDUCE_SCATTERV_IMPL"
+    echo "matrix_workspace_cache_per_key=$MATRIX_WORKSPACE_CACHE_PER_KEY"
     echo
   } > "$SUMMARY_FILE"
 }
@@ -242,6 +246,7 @@ if [[ "$RUN_MUON" == "1" ]]; then
       --optimizer muon \
       --mode fsdp2 \
       --mode matrix_owner_muon_role_greedy_custom_collective \
+      --matrix-max-cached-elastic-workspaces-per-key "$MATRIX_WORKSPACE_CACHE_PER_KEY" \
       --phase-timing \
       --runtime-summary || true
 fi
@@ -266,6 +271,7 @@ PY
         --optimizer muon \
         --mode fsdp2 \
         --mode matrix_owner_muon_role_greedy_custom_collective \
+        --matrix-max-cached-elastic-workspaces-per-key "$MATRIX_WORKSPACE_CACHE_PER_KEY" \
         --correctness \
         --candidate-mode matrix_owner_muon_role_greedy_custom_collective || true
   else

@@ -207,6 +207,70 @@ def load_balanced_matrix_owner_tail_plan(
     )
 
 
+def load_balanced_matrix_owner_tail_group_plans(
+    param_groups: Sequence[Sequence[PlannerParam]],
+    world_size: int,
+    *,
+    initial_rank_units: Sequence[int] | None = None,
+    merge_adjacent_rank_segments: bool = True,
+) -> tuple[MatrixGroupLayout, ...]:
+    """
+    Assign whole-matrix owners across multiple runtime groups.
+
+    The returned layouts are still one layout per input group, so runtime
+    materialization can stay at the transformer-block granularity. The owner
+    rank decision is made over all roles in ``param_groups`` at once, which
+    avoids an online planner over-fitting each group independently.
+    """
+
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}.")
+    if initial_rank_units is None:
+        rank_units = [0 for _ in range(world_size)]
+    else:
+        if len(initial_rank_units) != world_size:
+            raise ValueError(
+                f"initial_rank_units length must match world_size={world_size}, got {len(initial_rank_units)}."
+            )
+        rank_units = list(initial_rank_units)
+
+    roles: list[tuple[int, int, int, tuple[PlannerParam, ...]]] = []
+    for group_index, params in enumerate(param_groups):
+        matrix_params = [param for param in params if len(param.shape) == 2]
+        tail_params = [param for param in params if len(param.shape) != 2]
+        for role_index, param in enumerate(matrix_params):
+            roles.append((param.numel, group_index, role_index, (param,)))
+        if tail_params:
+            roles.append(
+                (sum(param.numel for param in tail_params), group_index, len(matrix_params), tuple(tail_params))
+            )
+
+    assignments_by_group: list[list[tuple[PlannerParam, int]]] = [[] for _ in param_groups]
+    for role_units, group_index, role_index, role_params in sorted(
+        roles,
+        key=lambda role: (-role[0], role[1], role[2]),
+    ):
+        fixed_rank = _fixed_owner_rank(role_params, world_size)
+        rank = (
+            fixed_rank
+            if fixed_rank is not None
+            else min(range(world_size), key=lambda candidate: (rank_units[candidate], candidate))
+        )
+        for param in role_params:
+            assignments_by_group[group_index].append((param, rank))
+        rank_units[rank] += role_units
+
+    return tuple(
+        _whole_param_owner_layout(
+            params,
+            world_size,
+            assignments_by_group[group_index],
+            merge_adjacent_rank_segments=merge_adjacent_rank_segments,
+        )
+        for group_index, params in enumerate(param_groups)
+    )
+
+
 def expert_owner_tail_plan(
     params: Sequence[PlannerParam],
     world_size: int,

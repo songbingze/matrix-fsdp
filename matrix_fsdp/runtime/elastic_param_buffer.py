@@ -6,114 +6,106 @@ from typing import Callable
 import torch
 
 from matrix_fsdp.core.layout import LayoutSegment
+from matrix_fsdp.runtime.workspace_cache import CommWorkspaceCache, CommWorkspaceLease, comm_workspace_key
 
 
 CustomAllGatherResolver = Callable[[tuple[tuple[LayoutSegment, ...], ...]], tuple[str, str]]
+ElasticParamBufferWorkspace = CommWorkspaceCache
+ElasticParamBufferWorkspaceLease = CommWorkspaceLease
 
 
-class ElasticParamBufferWorkspaceLease:
-    def __init__(self, workspace: "ElasticParamBufferWorkspace", key: tuple[object, ...], tensor: torch.Tensor) -> None:
-        self.workspace = workspace
+@dataclass(frozen=True)
+class ElasticRankChunk:
+    rank: int
+    global_start: int
+    global_end: int
+    local_start: int = 0
+
+    @property
+    def numel(self) -> int:
+        return self.global_end - self.global_start
+
+    def as_segment(self) -> LayoutSegment:
+        return LayoutSegment(self.global_start, self.global_end, self.local_start)
+
+
+@dataclass(frozen=True)
+class ElasticCommunicationPlan:
+    rank_segments: tuple[tuple[LayoutSegment, ...], ...]
+    coalesced_rank_segments: tuple[tuple[LayoutSegment, ...], ...]
+    rank_chunks: tuple[ElasticRankChunk, ...]
+    rank_chunk_shard_sizes: tuple[int, ...] | None
+    rank_chunk_segments: tuple[tuple[LayoutSegment, ...], ...] | None
+    rank_chunk_fast_path: bool
+    packed_full_order: bool
+
+    @property
+    def world_size(self) -> int:
+        return len(self.rank_segments)
+
+    @property
+    def segment_count(self) -> int:
+        return sum(len(segments) for segments in self.rank_segments)
+
+    @property
+    def coalesced_segment_count(self) -> int:
+        return sum(len(segments) for segments in self.coalesced_rank_segments)
+
+    @property
+    def max_segments_per_rank(self) -> int:
+        return max((len(segments) for segments in self.rank_segments), default=0)
+
+    @property
+    def max_coalesced_segments_per_rank(self) -> int:
+        return max((len(segments) for segments in self.coalesced_rank_segments), default=0)
+
+    @property
+    def rank_chunk_count(self) -> int:
+        return len(self.rank_chunks)
+
+    @property
+    def nonempty_rank_chunk_count(self) -> int:
+        return sum(1 for chunk in self.rank_chunks if chunk.numel > 0)
+
+    def as_summary(self) -> dict[str, object]:
+        return {
+            "communication_plan_segment_count": self.segment_count,
+            "communication_plan_coalesced_segment_count": self.coalesced_segment_count,
+            "communication_plan_max_segments_per_rank": self.max_segments_per_rank,
+            "communication_plan_max_coalesced_segments_per_rank": self.max_coalesced_segments_per_rank,
+            "communication_plan_rank_chunk_count": self.rank_chunk_count,
+            "communication_plan_nonempty_rank_chunk_count": self.nonempty_rank_chunk_count,
+            "communication_plan_rank_chunk_fast_path": self.rank_chunk_fast_path,
+            "communication_plan_packed_full_order": self.packed_full_order,
+            "communication_plan_has_rank_chunk_shard_sizes": self.rank_chunk_shard_sizes is not None,
+        }
+
+
+class ElasticRankChunkWorkspaceLease:
+    def __init__(
+        self,
+        buffer: "ElasticParamBuffer",
+        key: tuple[object, ...],
+        tensor: torch.Tensor,
+        *,
+        persistent: bool,
+        fallback_lease: CommWorkspaceLease | None = None,
+    ) -> None:
+        self.buffer = buffer
         self.key = key
         self.tensor = tensor
+        self.persistent = persistent
+        self.fallback_lease = fallback_lease
         self.released = False
 
     def release(self) -> None:
         if self.released:
             return
-        self.workspace.release(self)
+        if self.fallback_lease is not None:
+            self.fallback_lease.release()
+        else:
+            self.buffer.release_persistent_rank_chunk_workspace(self)
         self.released = True
-
-
-class ElasticParamBufferWorkspace:
-    def __init__(self, *, max_cached_per_key: int = 1) -> None:
-        if max_cached_per_key < 0:
-            raise ValueError("max_cached_per_key must be non-negative.")
-        self._entries: dict[tuple[object, ...], list[dict[str, object]]] = {}
-        self.max_cached_per_key = max_cached_per_key
-        self.acquire_count = 0
-        self.reuse_count = 0
-        self.allocate_count = 0
-
-    def acquire(self, reference: torch.Tensor, numel: int) -> ElasticParamBufferWorkspaceLease:
-        if numel < 0:
-            raise ValueError(f"numel must be non-negative, got {numel}.")
-        key = _workspace_key(reference, numel)
-        entries = self._entries.setdefault(key, [])
-        self.acquire_count += 1
-        for entry in entries:
-            if not entry["in_use"]:
-                entry["in_use"] = True
-                self.reuse_count += 1
-                return ElasticParamBufferWorkspaceLease(self, key, entry["tensor"])  # type: ignore[arg-type]
-        tensor = reference.new_empty(numel)
-        entries.append({"tensor": tensor, "in_use": True})
-        self.allocate_count += 1
-        return ElasticParamBufferWorkspaceLease(self, key, tensor)
-
-    def release(self, lease: ElasticParamBufferWorkspaceLease) -> None:
-        entries = self._entries.get(lease.key, ())
-        for index, entry in enumerate(entries):
-            if entry["tensor"] is lease.tensor:
-                if self.max_cached_per_key == 0:
-                    entries.pop(index)
-                    if not entries:
-                        self._entries.pop(lease.key, None)
-                    return
-                entry["in_use"] = False
-                self._trim_idle_entries(lease.key)
-                return
-        raise RuntimeError("Attempted to release a workspace tensor that is not owned by this workspace.")
-
-    def set_max_cached_per_key(self, max_cached_per_key: int) -> None:
-        if max_cached_per_key < 0:
-            raise ValueError("max_cached_per_key must be non-negative.")
-        self.max_cached_per_key = max_cached_per_key
-        for key in tuple(self._entries):
-            self._trim_idle_entries(key)
-
-    def stats(self) -> dict[str, object]:
-        allocated_numel = 0
-        in_use_numel = 0
-        allocated_tensors = 0
-        in_use_tensors = 0
-        for entries in self._entries.values():
-            for entry in entries:
-                tensor = entry["tensor"]
-                allocated_tensors += 1
-                allocated_numel += tensor.numel()  # type: ignore[union-attr]
-                if entry["in_use"]:
-                    in_use_tensors += 1
-                    in_use_numel += tensor.numel()  # type: ignore[union-attr]
-        return {
-            "workspace_acquire_count": self.acquire_count,
-            "workspace_reuse_count": self.reuse_count,
-            "workspace_allocate_count": self.allocate_count,
-            "workspace_max_cached_per_key": self.max_cached_per_key,
-            "workspace_allocated_tensors": allocated_tensors,
-            "workspace_in_use_tensors": in_use_tensors,
-            "workspace_allocated_numel": allocated_numel,
-            "workspace_in_use_numel": in_use_numel,
-        }
-
-    def clear(self) -> None:
-        self._entries.clear()
-
-    def _trim_idle_entries(self, key: tuple[object, ...]) -> None:
-        entries = self._entries.get(key)
-        if not entries:
-            return
-        idle_indices = [index for index, entry in enumerate(entries) if not entry["in_use"]]
-        overflow = len(idle_indices) - self.max_cached_per_key
-        for index in reversed(idle_indices[: max(overflow, 0)]):
-            entries.pop(index)
-        if not entries:
-            self._entries.pop(key, None)
-
-
-def _workspace_key(reference: torch.Tensor, numel: int) -> tuple[object, ...]:
-    device_index = reference.device.index if reference.device.index is not None else -1
-    return (reference.device.type, device_index, reference.dtype, numel)
 
 
 @dataclass(frozen=True)
@@ -202,6 +194,25 @@ class ElasticParamBufferLayout:
             "owner_imbalance_ratio": self.owner_imbalance_ratio,
         }
 
+    def build_communication_plan(self) -> ElasticCommunicationPlan:
+        rank_segments = self.rank_segments or _rank_segments_from_shard_sizes(self.shard_sizes)
+        coalesced_rank_segments = _coalesce_rank_segments(rank_segments)
+        rank_chunk_shard_sizes = _rank_chunk_shard_sizes(rank_segments)
+        rank_chunk_segments = (
+            _rank_chunk_segments_from_sizes(rank_chunk_shard_sizes)
+            if rank_chunk_shard_sizes is not None
+            else None
+        )
+        return ElasticCommunicationPlan(
+            rank_segments=rank_segments,
+            coalesced_rank_segments=coalesced_rank_segments,
+            rank_chunks=_rank_chunks_from_segments(rank_segments),
+            rank_chunk_shard_sizes=rank_chunk_shard_sizes,
+            rank_chunk_segments=rank_chunk_segments,
+            rank_chunk_fast_path=rank_chunk_shard_sizes is not None,
+            packed_full_order=self.packed_rank_shards_are_full_tensor_order,
+        )
+
 
 @dataclass(frozen=True)
 class ElasticParamBufferWorkspacePlan:
@@ -219,12 +230,12 @@ class ElasticParamBufferWorkspacePlan:
 
     @property
     def preferred_workspace_kind(self) -> str:
+        if self.native_sendrecv_chunk_capable:
+            return "rank_chunks"
         if self.native_group_broadcast_capable:
             return "owner_segment"
         if self.padded_all_gather_capable:
             return "padded_rank_chunks"
-        if self.native_sendrecv_chunk_capable:
-            return "rank_chunks"
         return "matrix_all_gather"
 
     @property
@@ -264,6 +275,105 @@ class ElasticParamBufferWorkspacePlan:
 class ElasticParamBuffer:
     layout: ElasticParamBufferLayout
     workspace: ElasticParamBufferWorkspace = field(default_factory=ElasticParamBufferWorkspace)
+    communication_plan: ElasticCommunicationPlan = field(init=False)
+    _persistent_rank_chunk_workspaces: dict[tuple[object, ...], dict[str, object]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    persistent_workspace_acquire_count: int = field(default=0, init=False)
+    persistent_workspace_reuse_count: int = field(default=0, init=False)
+    persistent_workspace_allocate_count: int = field(default=0, init=False)
+    persistent_workspace_fallback_count: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "communication_plan", self.layout.build_communication_plan())
+
+    def rank_chunk_workspace_numel(self, *, compact: bool) -> int:
+        return self.layout.total_shard_numel if compact else self.layout.padded_numel
+
+    def acquire_rank_chunk_workspace(
+        self,
+        reference: torch.Tensor,
+        *,
+        compact: bool,
+        persistent: bool = False,
+    ) -> ElasticParamBufferWorkspaceLease | ElasticRankChunkWorkspaceLease:
+        numel = self.rank_chunk_workspace_numel(compact=compact)
+        if not persistent:
+            return self.workspace.acquire(reference, numel)
+        return self.acquire_persistent_rank_chunk_workspace(reference, compact=compact)
+
+    def acquire_persistent_rank_chunk_workspace(
+        self,
+        reference: torch.Tensor,
+        *,
+        compact: bool,
+    ) -> ElasticRankChunkWorkspaceLease:
+        object.__setattr__(self, "persistent_workspace_acquire_count", self.persistent_workspace_acquire_count + 1)
+        numel = self.rank_chunk_workspace_numel(compact=compact)
+        key = (*comm_workspace_key(reference, numel), "compact" if compact else "padded")
+        entry = self._persistent_rank_chunk_workspaces.get(key)
+        if entry is None:
+            tensor = reference.new_empty(numel)
+            self._persistent_rank_chunk_workspaces[key] = {"tensor": tensor, "in_use": True}
+            object.__setattr__(
+                self,
+                "persistent_workspace_allocate_count",
+                self.persistent_workspace_allocate_count + 1,
+            )
+            return ElasticRankChunkWorkspaceLease(self, key, tensor, persistent=True)
+        if not entry["in_use"]:
+            entry["in_use"] = True
+            object.__setattr__(
+                self,
+                "persistent_workspace_reuse_count",
+                self.persistent_workspace_reuse_count + 1,
+            )
+            return ElasticRankChunkWorkspaceLease(self, key, entry["tensor"], persistent=True)  # type: ignore[arg-type]
+        object.__setattr__(
+            self,
+            "persistent_workspace_fallback_count",
+            self.persistent_workspace_fallback_count + 1,
+        )
+        fallback_lease = self.workspace.acquire(reference, numel)
+        return ElasticRankChunkWorkspaceLease(
+            self,
+            key,
+            fallback_lease.tensor,
+            persistent=False,
+            fallback_lease=fallback_lease,
+        )
+
+    def release_persistent_rank_chunk_workspace(self, lease: ElasticRankChunkWorkspaceLease) -> None:
+        entry = self._persistent_rank_chunk_workspaces.get(lease.key)
+        if entry is None or entry["tensor"] is not lease.tensor:
+            raise RuntimeError("Attempted to release a persistent elastic workspace that is not owned by this buffer.")
+        entry["in_use"] = False
+
+    def persistent_workspace_stats(self) -> dict[str, object]:
+        allocated_numel = 0
+        in_use_numel = 0
+        allocated_tensors = 0
+        in_use_tensors = 0
+        for entry in self._persistent_rank_chunk_workspaces.values():
+            tensor = entry["tensor"]
+            allocated_tensors += 1
+            allocated_numel += tensor.numel()  # type: ignore[union-attr]
+            if entry["in_use"]:
+                in_use_tensors += 1
+                in_use_numel += tensor.numel()  # type: ignore[union-attr]
+        return {
+            "persistent_workspace_acquire_count": self.persistent_workspace_acquire_count,
+            "persistent_workspace_reuse_count": self.persistent_workspace_reuse_count,
+            "persistent_workspace_allocate_count": self.persistent_workspace_allocate_count,
+            "persistent_workspace_fallback_count": self.persistent_workspace_fallback_count,
+            "persistent_workspace_allocated_tensors": allocated_tensors,
+            "persistent_workspace_in_use_tensors": in_use_tensors,
+            "persistent_workspace_allocated_numel": allocated_numel,
+            "persistent_workspace_in_use_numel": in_use_numel,
+        }
 
     def workspace_plan(
         self,
@@ -321,6 +431,7 @@ class ElasticParamBuffer:
                 effective_reduce_backend = custom_reduce_scatterv_impl
 
         return {
+            "param_buffer_type": "elastic",
             "param_gather_strategy": param_gather_strategy,
             "matrix_collective_backend": matrix_collective_backend,
             "effective_param_gather_backend": self.effective_param_gather_backend(
@@ -335,6 +446,7 @@ class ElasticParamBuffer:
             "effective_grad_reduce_backend": effective_reduce_backend,
             "resolved_custom_reduce_scatterv_impl": resolved_custom_reduce_impl,
             **self.layout.as_summary(),
+            **self.communication_plan.as_summary(),
             **self.workspace_plan(
                 can_direct_all_gather=can_direct_all_gather,
                 owner_segment_backend=owner_segment_backend,
@@ -342,6 +454,7 @@ class ElasticParamBuffer:
                 native_sendrecv_chunk_enabled=native_sendrecv_chunk_enabled,
             ).as_summary(),
             **self.workspace.stats(),
+            **self.persistent_workspace_stats(),
         }
 
     def effective_param_gather_backend(
@@ -376,3 +489,78 @@ def rank_segments_are_rank_contiguous_chunks(
             return False
         cursor = segment.global_end
     return True
+
+
+def _rank_segments_from_shard_sizes(shard_sizes: tuple[int, ...]) -> tuple[tuple[LayoutSegment, ...], ...]:
+    cursor = 0
+    rank_segments: list[tuple[LayoutSegment, ...]] = []
+    for shard_size in shard_sizes:
+        if shard_size == 0:
+            rank_segments.append(())
+            continue
+        rank_segments.append((LayoutSegment(cursor, cursor + shard_size, 0),))
+        cursor += shard_size
+    return tuple(rank_segments)
+
+
+def _coalesce_rank_segments(
+    rank_segments: tuple[tuple[LayoutSegment, ...], ...],
+) -> tuple[tuple[LayoutSegment, ...], ...]:
+    coalesced_ranks: list[tuple[LayoutSegment, ...]] = []
+    for segments in rank_segments:
+        if not segments:
+            coalesced_ranks.append(())
+            continue
+        coalesced: list[LayoutSegment] = []
+        for segment in segments:
+            if (
+                coalesced
+                and coalesced[-1].global_end == segment.global_start
+                and coalesced[-1].local_end == segment.local_start
+            ):
+                previous = coalesced[-1]
+                coalesced[-1] = LayoutSegment(previous.global_start, segment.global_end, previous.local_start)
+            else:
+                coalesced.append(segment)
+        coalesced_ranks.append(tuple(coalesced))
+    return tuple(coalesced_ranks)
+
+
+def _rank_chunk_shard_sizes(
+    rank_segments: tuple[tuple[LayoutSegment, ...], ...],
+) -> tuple[int, ...] | None:
+    cursor = 0
+    shard_sizes: list[int] = []
+    for segments in rank_segments:
+        if not segments:
+            shard_sizes.append(0)
+            continue
+        if len(segments) != 1:
+            return None
+        segment = segments[0]
+        if segment.local_start != 0 or segment.global_start != cursor:
+            return None
+        shard_sizes.append(segment.numel)
+        cursor = segment.global_end
+    return tuple(shard_sizes)
+
+
+def _rank_chunk_segments_from_sizes(shard_sizes: tuple[int, ...]) -> tuple[tuple[LayoutSegment, ...], ...]:
+    return _rank_segments_from_shard_sizes(shard_sizes)
+
+
+def _rank_chunks_from_segments(
+    rank_segments: tuple[tuple[LayoutSegment, ...], ...],
+) -> tuple[ElasticRankChunk, ...]:
+    chunks = []
+    for rank, segments in enumerate(rank_segments):
+        for segment in segments:
+            chunks.append(
+                ElasticRankChunk(
+                    rank=rank,
+                    global_start=segment.global_start,
+                    global_end=segment.global_end,
+                    local_start=segment.local_start,
+                )
+            )
+    return tuple(chunks)

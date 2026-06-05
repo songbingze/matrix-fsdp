@@ -5,6 +5,7 @@ from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
 from test.fsdp.bench_fsdp2_compare import (
+    BlockGroup,
     DEFAULT_FAST_MATRIX_MODE,
     DEFAULT_FULLY_SHARD_API_COMPARE_MODES,
     DEFAULT_MEMORY_ACCOUNTING_MODES,
@@ -15,6 +16,7 @@ from test.fsdp.bench_fsdp2_compare import (
     FSDP2CorrectnessResult,
     FSDP2MemoryTraceRow,
     FSDP2PhaseTimingRow,
+    MatrixRuntimeCommunicationRow,
     CopyInBenchmarkRow,
     ParamMaterializationBenchmarkRow,
     MixedMuonAdamWOptimizer,
@@ -22,6 +24,7 @@ from test.fsdp.bench_fsdp2_compare import (
     format_correctness_result,
     format_copyin_table,
     format_memory_trace_table,
+    format_runtime_communication_table,
     format_param_materialization_table,
     format_phase_timing_table,
     run_copyin_benchmark,
@@ -31,8 +34,15 @@ from test.fsdp.bench_fsdp2_compare import (
     _make_inputs,
     _make_model,
     _muon_params,
+    _prefetch_budget,
+    _is_unit,
 )
 from matrix_fsdp import MatrixFSDPOptimizer, make_muon_shard_aware_group_planner, matrix_fully_shard
+from scripts.run_isolated_gpu_benchmark import (
+    IsolatedBenchmarkRun,
+    _last_table_row_for_mode,
+    format_isolated_summary,
+)
 
 
 class FSDP2CompareBenchTest(unittest.TestCase):
@@ -44,6 +54,7 @@ class FSDP2CompareBenchTest(unittest.TestCase):
         self.assertFalse(config.activation_checkpoint)
         self.assertFalse(config.checkpoint_use_reentrant)
         self.assertFalse(config.activation_checkpoint_wrapper)
+        self.assertEqual(config.matrix_max_cached_elastic_workspaces_per_key, 0)
         self.assertEqual(DEFAULT_FAST_MATRIX_MODE, "matrix_default")
         self.assertEqual(config.modes, ("fsdp2", DEFAULT_FAST_MATRIX_MODE))
         self.assertIn("matrix_zero_copy_grad_bucket", EXPERIMENTAL_MODES)
@@ -51,7 +62,29 @@ class FSDP2CompareBenchTest(unittest.TestCase):
         self.assertIn("matrix_owner_muon_role_greedy_pre_backward", EXPERIMENTAL_MODES)
         self.assertIn("matrix_owner_muon_role_greedy_matrix_all_gather", EXPERIMENTAL_MODES)
         self.assertIn("matrix_owner_muon_role_greedy_custom_collective", EXPERIMENTAL_MODES)
+        self.assertIn("matrix_owner_muon_role_greedy_custom_collective_prefetch_cap2", EXPERIMENTAL_MODES)
+        self.assertIn("matrix_owner_muon_role_greedy_custom_collective_copy_in", EXPERIMENTAL_MODES)
+        self.assertIn("matrix_owner_muon_role_greedy_custom_collective_zero_copy_grad_bucket", EXPERIMENTAL_MODES)
+        self.assertIn("matrix_owner_muon_cost_aware_custom_collective", EXPERIMENTAL_MODES)
         self.assertEqual(DEFAULT_FULLY_SHARD_API_COMPARE_MODES, ("fsdp2_api", "matrix_api"))
+
+    def test_block_group_size_wraps_adjacent_benchmark_blocks(self):
+        config = FSDP2CompareConfig(
+            model="transformer_split_qkv",
+            unit="block",
+            layers=5,
+            hidden=16,
+            intermediate=32,
+            heads=4,
+            block_group_size=2,
+        )
+        model = _make_model(config)
+
+        groups = [module for module in model.modules() if isinstance(module, BlockGroup)]
+
+        self.assertEqual(len(groups), 3)
+        self.assertTrue(all(_is_unit(group, config) for group in groups))
+        self.assertTrue(all(not _is_unit(layer, config) for group in groups for layer in group.layers))
 
     def test_format_compare_table_includes_core_columns(self):
         rows = (
@@ -77,6 +110,7 @@ class FSDP2CompareBenchTest(unittest.TestCase):
         self.assertIn("mode", table)
         self.assertIn("avg_step_ms", table)
         self.assertIn("model", table)
+        self.assertIn("group", table)
         self.assertIn("optim", table)
         self.assertIn("budget", table)
         self.assertIn("peak_mem_mb", table)
@@ -206,6 +240,74 @@ class FSDP2CompareBenchTest(unittest.TestCase):
         self.assertIn("step_ms", table)
         self.assertIn("total_ms", table)
         self.assertIn("4096", table)
+        self.assertIn("group", table)
+
+    def test_isolated_benchmark_summary_parses_compare_table(self):
+        output = """
+mode            model  unit   group  device  world  layers  hidden  inter  seq  batch  optim  dtype    params  budget   avg_step_ms  peak_mem_mb
+--------------  -----  -----  -----  ------  -----  ------  ------  -----  ---  -----  -----  -------  ------  -------  -----------  -----------
+matrix_default  mlp    block  2      cpu     1      4       16      32     -    2      sgd    float32  4096    f=1/b=1  0.862        0.0
+"""
+        row = _last_table_row_for_mode(output, "matrix_default")
+        summary = format_isolated_summary(
+            (
+                IsolatedBenchmarkRun("matrix_default", 0, 0, avg_step_ms=float(row["avg_step_ms"]), peak_mem_mb=0.0),
+                IsolatedBenchmarkRun("matrix_default", 1, 0, avg_step_ms=1.0, peak_mem_mb=2.0),
+            )
+        )
+
+        self.assertEqual(row["group"], "2")
+        self.assertIn("p50_ms", summary)
+        self.assertIn("matrix_default", summary)
+
+    def test_prefetch_budget_reports_elastic_workspace_cache_limit(self):
+        model = matrix_fully_shard(nn.Linear(4, 2))
+        optimizer = MatrixFSDPOptimizer(
+            torch.optim.SGD(model.parameters(), lr=0.1),
+            model,
+            max_cached_elastic_workspaces_per_key=1,
+        )
+
+        self.assertIn("elastic_ws=1", _prefetch_budget(optimizer))
+
+    def test_format_runtime_communication_table_includes_workspace_cache_limit(self):
+        row = MatrixRuntimeCommunicationRow(
+            mode="matrix_owner_muon_role_greedy_custom_collective",
+            model="transformer_split_qkv",
+            unit="block",
+            device="cuda",
+            world_size=8,
+            optimizer="muon",
+            dtype="bfloat16",
+            param_groups=16,
+            gather_backend_counts="owner_broadcast:16",
+            resolved_custom_allgatherv_counts="native_sendrecv:16",
+            grad_reduce_backend_counts="native_reduce:16",
+            resolved_custom_reduce_scatterv_counts="native_reduce:16",
+            rank_chunk_fast_paths=16,
+            packed_full_order=16,
+            max_segment_count=8,
+            max_segments_per_rank=1,
+            max_padding_waste_ratio=0.0,
+            max_owner_imbalance_ratio=0.125,
+            workspace_preferred_kind_counts="owner_segment:16",
+            max_workspace_preferred_numel=1024,
+            max_workspace_padded_numel=1024,
+            max_workspace_padding_waste_ratio=0.0,
+            workspace_acquires=32,
+            workspace_reuses=16,
+            workspace_allocates=16,
+            workspace_cache_limit=1,
+            max_workspace_allocated_numel=1024,
+            min_shard_size=512,
+            max_shard_size=1024,
+        )
+
+        table = format_runtime_communication_table((row,))
+
+        self.assertIn("workspace_cache", table)
+        self.assertIn("native_reduce:16", table)
+        self.assertIn("owner_segment:16", table)
 
     def test_transformer_benchmark_model_uses_sequence_inputs(self):
         config = FSDP2CompareConfig(

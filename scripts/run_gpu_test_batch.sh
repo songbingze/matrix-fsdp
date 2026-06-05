@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 PYTHON_BIN="${PYTHON:-python}"
 WORLD_SIZE="${WORLD_SIZE:-4}"
@@ -22,6 +23,11 @@ DTYPE="${DTYPE:-bfloat16}"
 WARMUP_STEPS="${WARMUP_STEPS:-3}"
 PROFILE_STEPS="${PROFILE_STEPS:-3}"
 STEPS="${STEPS:-8}"
+MATRIX_WORKSPACE_CACHE_PER_KEY="${MATRIX_WORKSPACE_CACHE_PER_KEY:-1}"
+ISOLATED_TRIALS="${ISOLATED_TRIALS:-3}"
+BLOCK_GROUP_SIZES="${BLOCK_GROUP_SIZES:-1 2 4}"
+GROUP_SWEEP_MODES="${GROUP_SWEEP_MODES:-matrix_owner_muon_role_greedy_custom_collective}"
+GROUP_SWEEP_OPTIMIZER="${GROUP_SWEEP_OPTIMIZER:-muon}"
 
 BENCH_COMMON_ARGS=(
   --device cuda
@@ -54,10 +60,13 @@ Batches:
                     Compare FSDP2 AdamW against the best MatrixFSDP Muon path.
   fully-shard-api  Compare public fully_shard APIs using plain torch optimizers.
   compare-muon     Compare FSDP2 and MatrixFSDP with matrix-owner Muon.
+  trace-report     Write one GPU communication/phase/memory/runtime report.
+  preflight        Run CPU sanity checks and generate a GPU benchmark commands.sh runbook.
   runtime-profile  Capture MatrixFSDP event-level runtime memory traces.
   reserved-trace    Trace per-rank allocated/reserved memory on the large checkpointed transformer.
   checkpoint-large  Run large checkpoint-wrapper FSDP2/Matrix AdamW timing and correctness.
   copyin           Run CUDA grad bucket copy-in microbenchmarks.
+  group-sweep      Run isolated block-group-size sweeps for MatrixFSDP modes.
   large            Run opt-in larger transformer benchmark sweeps.
   all              Run cuda-smoke, planner, compare-adamw, fully-shard-api, compare-muon, runtime-profile, reserved-trace, copyin.
 
@@ -76,6 +85,9 @@ Useful environment overrides:
   ADAMW_VS_MUON_SEQ_LEN=4096
   ADAMW_VS_MUON_WARMUP_STEPS=2
   ADAMW_VS_MUON_STEPS=3
+  ISOLATED_TRIALS=3
+  BLOCK_GROUP_SIZES="1 2 4"
+  GROUP_SWEEP_MODES="matrix_owner_muon_role_greedy_custom_collective"
   HIDDEN=1024
   INTERMEDIATE=4096
   HEADS=8
@@ -85,6 +97,7 @@ Useful environment overrides:
   WARMUP_STEPS=3
   PROFILE_STEPS=3
   STEPS=8
+  MATRIX_WORKSPACE_CACHE_PER_KEY=1
 
 Run this from an environment with CUDA/NCCL, for example the remote dreamer
 conda environment. Set CUDA_VISIBLE_DEVICES outside this script if needed.
@@ -203,32 +216,48 @@ run_compare_muon() {
     --optimizer muon \
     --mode fsdp2 \
     --mode matrix_owner_muon \
-    --mode matrix_owner_muon_role_greedy
+    --mode matrix_owner_muon_role_greedy \
+    --mode matrix_owner_muon_cost_aware_custom_collective \
+    --matrix-max-cached-elastic-workspaces-per-key "$MATRIX_WORKSPACE_CACHE_PER_KEY"
   run_cmd "$PYTHON_BIN" test/fsdp/bench_fsdp2_compare.py "${BENCH_COMMON_ARGS[@]}" \
     --optimizer muon \
     --mode fsdp2 \
     --mode matrix_owner_muon \
     --correctness \
-    --candidate-mode matrix_owner_muon
+    --candidate-mode matrix_owner_muon \
+    --matrix-max-cached-elastic-workspaces-per-key "$MATRIX_WORKSPACE_CACHE_PER_KEY"
   run_cmd "$PYTHON_BIN" test/fsdp/bench_fsdp2_compare.py "${BENCH_COMMON_ARGS[@]}" \
     --optimizer muon \
     --mode fsdp2 \
     --mode matrix_owner_muon_role_greedy \
     --correctness \
-    --candidate-mode matrix_owner_muon_role_greedy
+    --candidate-mode matrix_owner_muon_role_greedy \
+    --matrix-max-cached-elastic-workspaces-per-key "$MATRIX_WORKSPACE_CACHE_PER_KEY"
   run_cmd "$PYTHON_BIN" test/fsdp/bench_fsdp2_compare.py "${BENCH_COMMON_ARGS[@]}" \
     --optimizer muon \
     --mode fsdp2 \
     --mode matrix_owner_muon \
     --mode matrix_owner_muon_role_greedy \
-    --memory-trace
+    --mode matrix_owner_muon_cost_aware_custom_collective \
+    --memory-trace \
+    --matrix-max-cached-elastic-workspaces-per-key "$MATRIX_WORKSPACE_CACHE_PER_KEY"
   run_cmd "$PYTHON_BIN" test/fsdp/bench_fsdp2_compare.py "${BENCH_COMMON_ARGS[@]}" \
     --optimizer muon \
     --mode fsdp2 \
     --mode matrix_owner_muon \
     --mode matrix_owner_muon_role_greedy \
     --mode matrix_owner_muon_role_greedy_custom_collective \
-    --phase-timing
+    --mode matrix_owner_muon_cost_aware_custom_collective \
+    --phase-timing \
+    --matrix-max-cached-elastic-workspaces-per-key "$MATRIX_WORKSPACE_CACHE_PER_KEY"
+}
+
+run_trace_report() {
+  run_cmd scripts/run_gpu_comm_report.sh
+}
+
+run_preflight() {
+  run_cmd scripts/prepare_gpu_benchmark.sh
 }
 
 run_compare_adamw_vs_muon() {
@@ -241,6 +270,7 @@ run_compare_adamw_vs_muon() {
   local steps="${ADAMW_VS_MUON_STEPS:-3}"
   local custom_gather="${MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL:-native_sendrecv}"
   local custom_reduce="${MATRIX_FSDP_CUSTOM_REDUCE_SCATTERV_IMPL:-native_reduce}"
+  local workspace_cache="${MATRIX_WORKSPACE_CACHE_PER_KEY:-1}"
   run_cmd env \
     "MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL=$custom_gather" \
     "MATRIX_FSDP_CUSTOM_REDUCE_SCATTERV_IMPL=$custom_reduce" \
@@ -258,6 +288,7 @@ run_compare_adamw_vs_muon() {
       --steps "$steps" \
       --custom-allgatherv-impl "$custom_gather" \
       --custom-reduce-scatterv-impl "$custom_reduce" \
+      --matrix-workspace-cache-per-key "$workspace_cache" \
       --json-config
 }
 
@@ -389,7 +420,19 @@ run_checkpoint_large() {
 
 run_copyin() {
   local layout
+  local backends
   for layout in flat matrix chunk_cat; do
+    case "$layout" in
+      flat)
+        backends=(--copyin-backend auto --copyin-backend flat_cat --copyin-backend foreach_copy --copyin-backend segment_copy)
+        ;;
+      matrix)
+        backends=(--copyin-backend auto --copyin-backend segment_copy)
+        ;;
+      chunk_cat)
+        backends=(--copyin-backend auto --copyin-backend chunk_cat --copyin-backend segment_copy)
+        ;;
+    esac
     run_cmd "$PYTHON_BIN" test/fsdp/bench_fsdp2_compare.py \
       --copyin-bench \
       --device cuda \
@@ -398,10 +441,37 @@ run_copyin() {
       --steps "$STEPS" \
       --warmup-steps "$WARMUP_STEPS" \
       --copyin-layout "$layout" \
-      --copyin-backend auto \
-      --copyin-backend segment_copy \
-      --copyin-backend foreach_copy \
-      --copyin-backend chunk_cat
+      "${backends[@]}"
+  done
+}
+
+run_group_sweep() {
+  local group_size
+  local mode
+  local mode_args=()
+  for mode in $GROUP_SWEEP_MODES; do
+    mode_args+=(--mode "$mode")
+  done
+  for group_size in $BLOCK_GROUP_SIZES; do
+    run_cmd "$PYTHON_BIN" scripts/run_isolated_gpu_benchmark.py \
+      --device cuda \
+      --world-size "$WORLD_SIZE" \
+      --model transformer_split_qkv \
+      --unit block \
+      --block-group-size "$group_size" \
+      --layers "$LAYERS" \
+      --hidden "$HIDDEN" \
+      --intermediate "$INTERMEDIATE" \
+      --seq-len "$SEQ_LEN" \
+      --heads "$HEADS" \
+      --batch-size "$BATCH_SIZE" \
+      --dtype "$DTYPE" \
+      --optimizer "$GROUP_SWEEP_OPTIMIZER" \
+      --warmup-steps "$WARMUP_STEPS" \
+      --steps "$STEPS" \
+      --trials "$ISOLATED_TRIALS" \
+      --matrix-max-cached-elastic-workspaces-per-key "$MATRIX_WORKSPACE_CACHE_PER_KEY" \
+      "${mode_args[@]}"
   done
 }
 
@@ -459,6 +529,12 @@ case "$batch" in
   compare-muon)
     run_compare_muon
     ;;
+  trace-report)
+    run_trace_report
+    ;;
+  preflight)
+    run_preflight
+    ;;
   runtime-profile)
     run_runtime_profile
     ;;
@@ -470,6 +546,9 @@ case "$batch" in
     ;;
   copyin)
     run_copyin
+    ;;
+  group-sweep)
+    run_group_sweep
     ;;
   large)
     run_large

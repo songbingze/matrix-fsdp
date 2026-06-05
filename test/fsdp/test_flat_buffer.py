@@ -9,6 +9,7 @@ from torch.distributed.tensor.placement_types import Replicate
 from torch import nn
 
 from matrix_fsdp.buffer_pool import FullParamBufferPool
+from matrix_fsdp.collectives import MatrixCollectiveHandle, MatrixTensorCollectiveHandle
 from matrix_fsdp.flat_buffer import MatrixFlatBuffer
 from matrix_fsdp.grad_bucket import (
     BucketParamGrad,
@@ -56,6 +57,14 @@ def _managed_params(*params: tuple[str, nn.Parameter]) -> list[ManagedParam]:
         )
         offset += param.numel()
     return managed_params
+
+
+class _FakeEvent:
+    def __init__(self, complete: bool = False) -> None:
+        self.complete = complete
+
+    def query(self) -> bool:
+        return self.complete
 
 
 class FlatBufferTest(unittest.TestCase):
@@ -266,6 +275,56 @@ class FlatBufferTest(unittest.TestCase):
         self.assertEqual(second_ptr, first_ptr)
         self.assertTrue(flat_buffer.param_data_alias_full_buffer())
         self.assertEqual(pool.stats()["reuses"], 1)
+
+    def test_full_param_buffer_pool_defers_reuse_until_release_event_completes(self):
+        pool = FullParamBufferPool(max_cached_per_key=1)
+        buffer = torch.arange(6, dtype=torch.float32)
+        release_event = _FakeEvent(complete=False)
+
+        release = pool.release(buffer, cuda_event=release_event)
+
+        self.assertEqual(release.kind, "pending_event")
+        self.assertEqual(release.numel, buffer.numel())
+        self.assertEqual(release.bytes, buffer.numel() * buffer.element_size())
+        stats = pool.stats()
+        self.assertEqual(stats["cached_buffers"], 0)
+        self.assertEqual(stats["pending_buffers"], 1)
+        self.assertEqual(stats["pending_releases"], 1)
+
+        fresh = pool.acquire(buffer, buffer.numel())
+        self.assertNotEqual(fresh.data_ptr(), buffer.data_ptr())
+
+        release_event.complete = True
+        acquired = pool.acquire(buffer, buffer.numel())
+
+        self.assertEqual(acquired.data_ptr(), buffer.data_ptr())
+        stats = pool.stats()
+        self.assertEqual(stats["pending_buffers"], 0)
+        self.assertEqual(stats["reuses"], 1)
+
+    def test_all_gather_handle_reports_full_buffer_materialization_reuse(self):
+        param = nn.Parameter(torch.arange(6, dtype=torch.float32).view(2, 3))
+        plan = ShardPlan(
+            total_numel=6,
+            shard_sizes=(6,),
+            shard_offsets=(0,),
+        )
+        pool = FullParamBufferPool(max_cached_per_key=1)
+        flat_buffer = MatrixFlatBuffer([_managed_param(param)], plan, rank=0, full_param_buffer_pool=pool)
+
+        first_handle = flat_buffer.start_all_gather_full_params()
+        flat_buffer.finish_all_gather_full_params(first_handle)
+        flat_buffer.use_local_shards()
+        flat_buffer.clear_full_params()
+        second_handle = flat_buffer.start_all_gather_full_params()
+
+        self.assertEqual(first_handle.param_materialization_kind, "single_rank_copy")
+        self.assertEqual(first_handle.param_materialization_numel, 6)
+        self.assertEqual(first_handle.param_materialization_bytes, 24)
+        self.assertFalse(first_handle.param_materialization_reused)
+        self.assertTrue(first_handle.param_materialization_rank_chunk_fast_path)
+        self.assertTrue(first_handle.param_materialization_packed_full_order)
+        self.assertTrue(second_handle.param_materialization_reused)
 
     def test_shrink_full_params_uses_pool_when_cache_capacity_exists(self):
         param = nn.Parameter(torch.arange(6, dtype=torch.float32).view(2, 3))
@@ -601,10 +660,11 @@ class FlatBufferTest(unittest.TestCase):
             summary = flat_buffer.communication_summary()
 
         self.assertEqual(summary["effective_param_gather_backend"], "owner_segment:custom")
+        self.assertEqual(summary["param_buffer_type"], "elastic")
         self.assertEqual(summary["custom_allgatherv_policy"], "auto")
-        self.assertEqual(summary["resolved_custom_allgatherv_impl"], "native_sendrecv")
-        self.assertEqual(summary["effective_grad_reduce_backend"], "native_reduce")
-        self.assertEqual(summary["resolved_custom_reduce_scatterv_impl"], "native_reduce")
+        self.assertEqual(summary["resolved_custom_allgatherv_impl"], "uneven_all_gather")
+        self.assertEqual(summary["effective_grad_reduce_backend"], "uneven_reduce_scatter")
+        self.assertEqual(summary["resolved_custom_reduce_scatterv_impl"], "uneven_reduce_scatter")
         self.assertTrue(summary["rank_chunk_fast_path"])
         self.assertTrue(summary["packed_rank_shards_are_full_tensor_order"])
         self.assertEqual(summary["segment_count"], 2)
@@ -697,6 +757,103 @@ class FlatBufferTest(unittest.TestCase):
         self.assertTrue(flat_buffer.grad_bucket_input_is_compact)
         self.assertEqual(flat_buffer.grad_bucket_input.numel(), 4)
 
+    def test_owner_copy_in_uses_compact_elastic_workspace(self):
+        first = nn.Parameter(torch.arange(3, dtype=torch.float32))
+        second = nn.Parameter(torch.arange(10, 11, dtype=torch.float32))
+        managed_params = _managed_params(("first", first), ("second", second))
+        plan = ShardPlan(
+            total_numel=4,
+            shard_sizes=(3, 1),
+            shard_offsets=(0, 3),
+            rank_segments=(
+                (LayoutSegment(0, 3, 0),),
+                (LayoutSegment(3, 4, 0),),
+            ),
+        )
+        flat_buffer = MatrixFlatBuffer(managed_params, plan, rank=0, matrix_collective_backend="custom")
+        first.grad = torch.tensor([1.0, 2.0, 3.0])
+        second.grad = torch.tensor([4.0])
+        captured = {}
+
+        def fake_reduce(packed_rank_chunks, shard_sizes, rank, **kwargs):
+            captured["packed"] = packed_rank_chunks.clone()
+            captured["compact"] = kwargs["compact"]
+            captured["shard_sizes"] = shard_sizes
+            local_grad_shard = packed_rank_chunks[: shard_sizes[rank]].clone()
+            return MatrixTensorCollectiveHandle(local_grad_shard, lambda: local_grad_shard, _waited=True)
+
+        bucket = flat_buffer.collect_grad_bucket()
+        with mock.patch("matrix_fsdp.runtime.flat_buffer.reduce_scatterv_owner_rank_chunks_1d_async", fake_reduce):
+            result = flat_buffer.start_reduce_grad_bucket_to_local_shard_with_stats(bucket)
+            torch.testing.assert_close(result.handle.wait(), torch.tensor([1.0, 2.0, 3.0]))
+
+        self.assertEqual(result.stats.layout_kind, "compact_owner")
+        self.assertEqual(result.stats.packed_numel, 4)
+        self.assertEqual(result.stats.packed_bytes, 16)
+        self.assertEqual(result.stats.workspace_kind, "compact_rank_chunks")
+        self.assertEqual(result.stats.workspace_numel, 4)
+        self.assertEqual(result.stats.workspace_padding_waste_numel, 0)
+        self.assertTrue(result.stats.workspace_persistent)
+        self.assertTrue(captured["compact"])
+        self.assertEqual(captured["shard_sizes"], (3, 1))
+        torch.testing.assert_close(captured["packed"], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        self.assertEqual(flat_buffer.elastic_param_buffer.workspace.stats()["workspace_acquire_count"], 0)
+        persistent_stats = flat_buffer.elastic_param_buffer.persistent_workspace_stats()
+        self.assertEqual(persistent_stats["persistent_workspace_acquire_count"], 1)
+        self.assertEqual(persistent_stats["persistent_workspace_allocate_count"], 1)
+        self.assertEqual(persistent_stats["persistent_workspace_allocated_numel"], 4)
+        self.assertEqual(persistent_stats["persistent_workspace_in_use_tensors"], 0)
+
+    def test_owner_all_gather_handle_reports_materialization_layout(self):
+        first = nn.Parameter(torch.arange(3, dtype=torch.float32))
+        second = nn.Parameter(torch.arange(10, 11, dtype=torch.float32))
+        managed_params = _managed_params(("first", first), ("second", second))
+        plan = ShardPlan(
+            total_numel=4,
+            shard_sizes=(3, 1),
+            shard_offsets=(0, 3),
+            rank_segments=(
+                (LayoutSegment(0, 3, 0),),
+                (LayoutSegment(3, 4, 0),),
+            ),
+        )
+        flat_buffer = MatrixFlatBuffer(managed_params, plan, rank=0, matrix_collective_backend="custom")
+
+        captured = {}
+
+        def fake_all_gatherv(*args, **kwargs):
+            captured["rank_segments"] = args[2]
+            captured["coalesced_rank_segments"] = kwargs["coalesced_rank_segments"]
+            captured["rank_chunk_shard_sizes"] = kwargs["rank_chunk_shard_sizes"]
+            captured["rank_chunk_segments"] = kwargs["rank_chunk_segments"]
+            return MatrixCollectiveHandle(lambda: args[1])
+
+        with (
+            mock.patch.object(flat_buffer, "_is_single_rank_shard_group", return_value=False),
+            mock.patch("matrix_fsdp.runtime.flat_buffer.all_gatherv_rank_segments_1d_into_async", fake_all_gatherv),
+        ):
+            handle = flat_buffer.start_all_gather_full_params()
+
+        self.assertEqual(handle.param_materialization_kind, "owner_segment:custom")
+        self.assertEqual(handle.param_materialization_numel, 4)
+        self.assertEqual(handle.param_materialization_bytes, 16)
+        self.assertFalse(handle.param_materialization_reused)
+        self.assertTrue(handle.param_materialization_rank_chunk_fast_path)
+        self.assertTrue(handle.param_materialization_packed_full_order)
+        self.assertIs(captured["rank_segments"], flat_buffer.elastic_param_buffer.communication_plan.rank_segments)
+        self.assertIs(
+            captured["coalesced_rank_segments"],
+            flat_buffer.elastic_param_buffer.communication_plan.coalesced_rank_segments,
+        )
+        self.assertEqual(captured["rank_chunk_shard_sizes"], (3, 1))
+        self.assertEqual(
+            captured["rank_chunk_segments"],
+            (
+                (LayoutSegment(0, 3, 0),),
+                (LayoutSegment(3, 4, 0),),
+            ),
+        )
+
     def test_custom_collective_prefetch_skip_is_backend_aware(self):
         first = nn.Parameter(torch.arange(3, dtype=torch.float32))
         second = nn.Parameter(torch.arange(10, 11, dtype=torch.float32))
@@ -712,11 +869,11 @@ class FlatBufferTest(unittest.TestCase):
         )
         flat_buffer = MatrixFlatBuffer(managed_params, plan, rank=0, matrix_collective_backend="custom")
 
-        with mock.patch.dict("os.environ", {"MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_sendrecv"}):
-            self.assertEqual(
-                flat_buffer.owner_segment_prefetch_skip_reason(),
-                "custom_allgatherv:native_sendrecv",
-            )
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_sendrecv"}), mock.patch(
+            "matrix_fsdp.kernels.custom_collectives.native_kernel_available",
+            return_value=True,
+        ):
+            self.assertIsNone(flat_buffer.owner_segment_prefetch_skip_reason())
         with mock.patch.dict(
             "os.environ",
             {"MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_group_broadcast"},
@@ -752,6 +909,34 @@ class FlatBufferTest(unittest.TestCase):
             },
         ):
             self.assertIsNone(flat_buffer.owner_segment_prefetch_skip_reason())
+
+    def test_custom_collective_prefetch_skips_native_sendrecv_for_non_chunk_layout(self):
+        first = nn.Parameter(torch.arange(2, dtype=torch.float32))
+        second = nn.Parameter(torch.arange(10, 12, dtype=torch.float32))
+        third = nn.Parameter(torch.arange(20, 22, dtype=torch.float32))
+        managed_params = _managed_params(("first", first), ("second", second), ("third", third))
+        plan = ShardPlan(
+            total_numel=6,
+            shard_sizes=(4, 2),
+            shard_offsets=(0, 4),
+            rank_segments=(
+                (
+                    LayoutSegment(0, 2, 0),
+                    LayoutSegment(4, 6, 2),
+                ),
+                (LayoutSegment(2, 4, 0),),
+            ),
+        )
+        flat_buffer = MatrixFlatBuffer(managed_params, plan, rank=0, matrix_collective_backend="custom")
+
+        with mock.patch.dict("os.environ", {"MATRIX_FSDP_CUSTOM_ALLGATHERV_IMPL": "native_sendrecv"}), mock.patch(
+            "matrix_fsdp.kernels.custom_collectives.native_kernel_available",
+            return_value=True,
+        ):
+            self.assertEqual(
+                flat_buffer.owner_segment_prefetch_skip_reason(),
+                "custom_allgatherv:native_sendrecv",
+            )
 
     def test_flat_buffer_rejects_unknown_matrix_collective_backend(self):
         param = nn.Parameter(torch.arange(4, dtype=torch.float32))
@@ -896,7 +1081,7 @@ class FlatBufferTest(unittest.TestCase):
             torch.tensor([10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 20.0, 21.0, 22.0, 23.0]),
         )
 
-    def test_grad_bucket_copy_in_reuses_elastic_workspace_after_wait(self):
+    def test_grad_bucket_copy_in_reuses_static_workspace_after_wait(self):
         weight = nn.Parameter(torch.arange(6, dtype=torch.float32).view(2, 3))
         bias = nn.Parameter(torch.arange(4, dtype=torch.float32))
         managed_params = _managed_params(("weight", weight), ("bias", bias))
@@ -905,24 +1090,26 @@ class FlatBufferTest(unittest.TestCase):
             shard_sizes=(10,),
             shard_offsets=(0,),
         )
-        flat_buffer = MatrixFlatBuffer(managed_params, plan, rank=0)
+        flat_buffer = MatrixFlatBuffer(managed_params, plan, rank=0, param_gather_strategy="matrix_all_gather")
 
         for _ in range(2):
             weight.grad = torch.arange(10, 16, dtype=torch.float32).view(2, 3)
             bias.grad = torch.arange(20, 24, dtype=torch.float32)
             bucket = flat_buffer.collect_grad_bucket()
             result = flat_buffer.start_reduce_grad_bucket_to_local_shard_with_stats(bucket)
+            self.assertTrue(result.stats.needs_copy_in)
             torch.testing.assert_close(
                 result.handle.wait(),
                 torch.tensor([10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 20.0, 21.0, 22.0, 23.0]),
             )
 
-        stats = flat_buffer.elastic_param_buffer.workspace.stats()
+        stats = flat_buffer.static_param_buffer.workspace.stats()
 
         self.assertEqual(stats["workspace_acquire_count"], 2)
         self.assertEqual(stats["workspace_allocate_count"], 1)
         self.assertEqual(stats["workspace_reuse_count"], 1)
         self.assertEqual(stats["workspace_in_use_tensors"], 0)
+        self.assertEqual(flat_buffer.elastic_param_buffer.workspace.stats()["workspace_acquire_count"], 0)
 
     def test_local_grad_shard_is_tracked_and_cleared(self):
         param = nn.Parameter(torch.arange(6, dtype=torch.float32).view(2, 3))

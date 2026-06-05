@@ -258,12 +258,11 @@ class OptimizerStateTest(unittest.TestCase):
 
         self.assertIsInstance(optimizer.optimizer, MixedMuonAdamWOptimizer)
         self.assertEqual(optimizer.scheduler.max_cached_elastic_workspaces_per_key, 1)
-        self.assertEqual(
-            model._matrix_fsdp_param_group.flat_buffer.elastic_param_buffer.workspace.stats()[
-                "workspace_max_cached_per_key"
-            ],
-            1,
-        )
+        for param_buffer in (
+            model._matrix_fsdp_param_group.flat_buffer.static_param_buffer,
+            model._matrix_fsdp_param_group.flat_buffer.elastic_param_buffer,
+        ):
+            self.assertEqual(param_buffer.workspace.stats()["workspace_max_cached_per_key"], 1)
         self.assertFalse(optimizer.optimizer.adamw.defaults["foreach"])
         self.assertEqual(DEFAULT_MUON_ADJUST_LR_FN, "match_rms_adamw")
         self.assertEqual(optimizer.optimizer.muon.param_groups[0]["adjust_lr_fn"], DEFAULT_MUON_ADJUST_LR_FN)
@@ -302,12 +301,11 @@ class OptimizerStateTest(unittest.TestCase):
         self.assertIsInstance(optimizer, MixedMuonAdamWOptimizer)
         self.assertIs(optimizer.matrix_fsdp, optimizer)
         self.assertEqual(optimizer.scheduler.max_cached_elastic_workspaces_per_key, 1)
-        self.assertEqual(
-            model._matrix_fsdp_param_group.flat_buffer.elastic_param_buffer.workspace.stats()[
-                "workspace_max_cached_per_key"
-            ],
-            1,
-        )
+        for param_buffer in (
+            model._matrix_fsdp_param_group.flat_buffer.static_param_buffer,
+            model._matrix_fsdp_param_group.flat_buffer.elastic_param_buffer,
+        ):
+            self.assertEqual(param_buffer.workspace.stats()["workspace_max_cached_per_key"], 1)
         self.assertEqual(optimizer.runtime_param_groups, [model._matrix_fsdp_param_group])
         self.assertEqual(optimizer.muon.defaults["lr"], 0.004)
         self.assertEqual(optimizer.adamw.defaults["lr"], 0.004)

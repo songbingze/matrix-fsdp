@@ -106,7 +106,7 @@ class RuntimeProfileToolTest(unittest.TestCase):
         result = run_profile(
             RuntimeProfileConfig(
                 model="transformer_split_qkv",
-                mode="matrix_owner_muon_role_greedy",
+                mode="matrix_owner_muon_role_greedy_custom_collective_zero_copy_grad_bucket",
                 optimizer="muon",
                 layers=1,
                 hidden=16,
@@ -123,7 +123,7 @@ class RuntimeProfileToolTest(unittest.TestCase):
         scheduler_summary = result["runtime_summary"]["schedulers"][0]
         event_names = [event["name"] for event in result["runtime_summary"]["events"]]
 
-        self.assertEqual(result["config"]["mode"], "matrix_owner_muon_role_greedy")
+        self.assertEqual(result["config"]["mode"], "matrix_owner_muon_role_greedy_custom_collective_zero_copy_grad_bucket")
         self.assertIn("prepare_grad_bucket_zero_copy", event_names)
         self.assertGreater(scheduler_summary["max_grad_bucket_bytes"], 0)
         self.assertTrue(scheduler_summary["runtime_memory_snapshots"])
@@ -139,6 +139,32 @@ class RuntimeProfileToolTest(unittest.TestCase):
                 for snapshot in scheduler_summary["runtime_memory_snapshots"]
             )
         )
+
+    @unittest.skipUnless(hasattr(torch.optim, "Muon"), "requires torch.optim.Muon")
+    def test_matrix_owner_muon_copy_in_profile_reports_copy_in_grad_bucket(self):
+        result = run_profile(
+            RuntimeProfileConfig(
+                model="transformer_split_qkv",
+                mode="matrix_owner_muon_role_greedy_custom_collective",
+                optimizer="muon",
+                layers=1,
+                hidden=16,
+                intermediate=32,
+                heads=4,
+                seq_len=8,
+                batch_size=2,
+                warmup_steps=0,
+                profile_steps=0,
+                steps=1,
+            )
+        )
+
+        event_names = [event["name"] for event in result["runtime_summary"]["events"]]
+
+        self.assertEqual(result["config"]["mode"], "matrix_owner_muon_role_greedy_custom_collective")
+        self.assertIn("prepare_grad_bucket_copy_in", event_names)
+        self.assertIn("copy_in_grad_bucket", event_names)
+        self.assertNotIn("prepare_grad_bucket_zero_copy", event_names)
 
     def test_main_can_write_json_output(self):
         with tempfile.NamedTemporaryFile(suffix=".json") as output_file:

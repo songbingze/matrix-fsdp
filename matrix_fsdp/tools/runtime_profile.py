@@ -214,6 +214,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "matrix_owner_muon",
             "matrix_owner_muon_role_greedy",
             "matrix_owner_muon_role_greedy_custom_collective",
+            "matrix_owner_muon_role_greedy_custom_collective_copy_in",
+            "matrix_owner_muon_role_greedy_custom_collective_zero_copy_grad_bucket",
         ),
         default="prefetch_bucket_copy_in",
     )
@@ -340,6 +342,8 @@ def _prepare_mode(
         "matrix_owner_muon",
         "matrix_owner_muon_role_greedy",
         "matrix_owner_muon_role_greedy_custom_collective",
+        "matrix_owner_muon_role_greedy_custom_collective_copy_in",
+        "matrix_owner_muon_role_greedy_custom_collective_zero_copy_grad_bucket",
     ):
         return _prepare_matrix_owner_muon(model, mesh, config)
 
@@ -394,7 +398,8 @@ def _prepare_matrix_owner_muon(
     if config.optimizer != "muon":
         raise ValueError("matrix_owner_muon modes require --optimizer muon.")
     owner_assignment = "role_greedy" if "role_greedy" in config.mode else "rotate"
-    matrix_collective_backend = "custom" if config.mode.endswith("_custom_collective") else "owner_broadcast"
+    matrix_collective_backend = "custom" if "custom_collective" in config.mode else "owner_broadcast"
+    use_zero_copy_grad_bucket = config.mode.endswith("_zero_copy_grad_bucket")
     sharded_model = matrix_fully_shard(
         model,
         mesh,
@@ -406,7 +411,7 @@ def _prepare_matrix_owner_muon(
         backward_prefetch=True,
         finalize_after_backward=True,
         backward_reduce_strategy="bucket_reduce_scatter",
-        use_zero_copy_grad_bucket=True,
+        use_zero_copy_grad_bucket=use_zero_copy_grad_bucket,
         matrix_collective_backend=matrix_collective_backend,
     )
     optimizer = MatrixFSDPOptimizer(

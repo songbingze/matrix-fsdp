@@ -21,12 +21,14 @@ from matrix_fsdp.runtime.collectives import (
     reduce_scatterv_owner_rank_chunks_1d_async,
     MatrixTensorCollectiveHandle,
 )
-from matrix_fsdp.runtime.buffer_pool import FullParamBufferPool
+from matrix_fsdp.runtime.buffer_pool import FullParamBufferPool, FullParamBufferRelease
 from matrix_fsdp.runtime.elastic_param_buffer import (
     ElasticParamBuffer,
     ElasticParamBufferLayout,
-    ElasticParamBufferWorkspaceLease,
+    ElasticRankChunkWorkspaceLease,
 )
+from matrix_fsdp.runtime.static_param_buffer import StaticParamBuffer, StaticParamBufferLayout
+from matrix_fsdp.runtime.workspace_cache import CommWorkspaceCache, CommWorkspaceLease
 from matrix_fsdp.runtime.grad_bucket import (
     BucketParamGrad,
     CopyInLayoutKind,
@@ -71,12 +73,24 @@ class GradBucketReduceStartStats:
     reduce_scatter_enqueue_ms: float
     packed_numel: int
     packed_bytes: int
+    workspace_kind: str | None = None
+    workspace_numel: int = 0
+    workspace_padding_waste_numel: int = 0
+    workspace_persistent: bool = False
 
 
 @dataclass(frozen=True)
 class GradBucketReduceStart:
     handle: MatrixTensorCollectiveHandle
     stats: GradBucketReduceStartStats
+
+
+@dataclass(frozen=True)
+class FullParamClearStats:
+    kind: str
+    release: FullParamBufferRelease | None = None
+    numel: int = 0
+    bytes: int = 0
 
 
 class MatrixFlatBuffer:
@@ -153,8 +167,16 @@ class MatrixFlatBuffer:
         )
         self.grad_state: MatrixShardedState | None = None
         self.local_param_views = self._build_local_param_views()
+        self._local_views_by_param_cache = self._build_local_views_by_param()
         self.elastic_param_buffer = ElasticParamBuffer(
             ElasticParamBufferLayout(
+                total_numel=self.plan.total_numel,
+                shard_sizes=self.shard_sizes,
+                rank_segments=self.plan.rank_segments,
+            )
+        )
+        self.static_param_buffer = StaticParamBuffer(
+            StaticParamBufferLayout(
                 total_numel=self.plan.total_numel,
                 shard_sizes=self.shard_sizes,
                 rank_segments=self.plan.rank_segments,
@@ -165,6 +187,7 @@ class MatrixFlatBuffer:
         self.local_grad_accumulator: torch.Tensor | None = None
         self.grad_bucket_input: torch.Tensor | None = None
         self.grad_bucket_input_is_compact: bool = False
+        self._packed_grad_offset_cache: dict[bool, dict[str, int | None]] = {}
 
     @property
     def sharded_param(self):
@@ -286,38 +309,60 @@ class MatrixFlatBuffer:
         validate_owner_collective_signature: bool = True,
     ) -> MatrixCollectiveHandle:
         all_gather_input = self._maybe_to_param_dtype(self.local_shard)
+        full_buffer_reused = self.full_buffer is not None
         if self.full_buffer is None:
-            self.full_buffer = self.full_param_buffer_pool.acquire(
+            acquired = self.full_param_buffer_pool.acquire_with_stats(
                 self._param_reference_tensor(),
                 self.plan.total_numel,
             )
+            self.full_buffer = acquired.tensor
+            full_buffer_reused = acquired.reused
         else:
             self._resize_full_buffer_storage(self.plan.total_numel)
         if self._is_single_rank_shard_group():
             self.full_buffer.copy_(all_gather_input)
-            return MatrixCollectiveHandle(lambda: self.full_buffer)
+            handle = MatrixCollectiveHandle(lambda: self.full_buffer)
+            return self._annotate_param_materialization_handle(
+                handle,
+                kind="single_rank_copy",
+                full_buffer_reused=full_buffer_reused,
+            )
         if self.param_gather_strategy == "equal_all_gather" and not self._can_direct_all_gather_full_params():
             raise RuntimeError("param_gather_strategy='equal_all_gather' requires equal rank-ordered shards.")
         if self.param_gather_strategy != "matrix_all_gather" and self._can_direct_all_gather_full_params():
-            return all_gather_equal_1d_into_async(
+            handle = all_gather_equal_1d_into_async(
                 all_gather_input,
                 self.full_buffer,
                 group=self.group,
                 cuda_stream=self.cuda_all_gather_stream,
             )
+            return self._annotate_param_materialization_handle(
+                handle,
+                kind="equal_all_gather",
+                full_buffer_reused=full_buffer_reused,
+            )
         if self.param_gather_strategy == "owner_broadcast" and not self._can_owner_broadcast_full_params():
             raise RuntimeError("param_gather_strategy='owner_broadcast' requires whole-parameter owner shards.")
         if self._should_use_owner_segment_collectives():
-            return all_gatherv_rank_segments_1d_into_async(
+            communication_plan = self.elastic_param_buffer.communication_plan
+            handle = all_gatherv_rank_segments_1d_into_async(
                 all_gather_input,
                 self.full_buffer,
-                self.plan.rank_segments,
+                communication_plan.rank_segments,
                 self.rank,
                 backend=self._owner_segment_collective_backend(),
                 group=self.group,
                 cuda_stream=self.cuda_all_gather_stream,
                 collective_key=self.collective_key,
                 validate_owner_collective_signature=validate_owner_collective_signature,
+                coalesced_rank_segments=communication_plan.coalesced_rank_segments,
+                rank_chunk_shard_sizes=communication_plan.rank_chunk_shard_sizes,
+                rank_chunk_segments=communication_plan.rank_chunk_segments,
+            )
+            return self._annotate_param_materialization_handle(
+                handle,
+                kind=f"owner_segment:{self._owner_segment_collective_backend()}",
+                full_buffer_reused=full_buffer_reused,
             )
 
         packed_handle = all_gather_matrix_shard_1d_into_async(
@@ -332,7 +377,34 @@ class MatrixFlatBuffer:
         def wait() -> torch.Tensor:
             return self._unpack_rank_shards_to_full_tensor(packed_handle.wait())
 
-        return MatrixCollectiveHandle(wait)
+        return self._annotate_param_materialization_handle(
+            MatrixCollectiveHandle(wait),
+            kind="matrix_all_gather",
+            full_buffer_reused=full_buffer_reused,
+        )
+
+    def _annotate_param_materialization_handle(
+        self,
+        handle: MatrixCollectiveHandle,
+        *,
+        kind: str,
+        full_buffer_reused: bool,
+    ) -> MatrixCollectiveHandle:
+        handle.param_materialization_kind = kind
+        handle.param_materialization_numel = int(self.plan.total_numel)
+        handle.param_materialization_bytes = int(self.plan.total_numel) * int(self._param_reference_tensor().element_size())
+        handle.param_materialization_reused = bool(full_buffer_reused)
+        handle.param_materialization_rank_chunk_fast_path = bool(
+            self.elastic_param_buffer.layout.rank_chunk_fast_path
+            if kind.startswith("owner_segment")
+            else self.static_param_buffer.layout.rank_chunk_fast_path
+        )
+        handle.param_materialization_packed_full_order = bool(
+            self.elastic_param_buffer.layout.packed_rank_shards_are_full_tensor_order
+            if kind.startswith("owner_segment")
+            else self.static_param_buffer.layout.packed_rank_shards_are_full_tensor_order
+        )
+        return handle
 
     def finish_all_gather_full_params(self, handle: MatrixCollectiveHandle) -> None:
         self.use_full_param_buffer(handle.wait())
@@ -584,7 +656,7 @@ class MatrixFlatBuffer:
             copy_in_ms = 0.0
             workspace_lease = None
             if packed_rank_chunks is None:
-                workspace_lease = self.elastic_param_buffer.workspace.acquire(
+                workspace_lease = self._comm_workspace().acquire(
                     self._reduce_reference_tensor(),
                     bucket.world_size * bucket.max_shard_size,
                 )
@@ -615,7 +687,7 @@ class MatrixFlatBuffer:
             if bucket.packed_input is not None:
                 packed_rank_chunks = self._maybe_to_reduce_dtype(bucket.packed_input)
             else:
-                workspace_lease = self.elastic_param_buffer.workspace.acquire(
+                workspace_lease = self._comm_workspace().acquire(
                     self._reduce_reference_tensor(),
                     bucket.world_size * bucket.max_shard_size,
                 )
@@ -649,21 +721,43 @@ class MatrixFlatBuffer:
         needs_copy_in = packed_rank_chunks is None
         layout_kind = classify_copy_in_layout(bucket)
         packed_input_is_compact = bucket.packed_input_is_compact
+        workspace_kind = "compact_rank_chunks" if packed_input_is_compact else "padded_rank_chunks"
+        workspace_numel = packed_rank_chunks.numel() if packed_rank_chunks is not None else 0
+        workspace_padding_waste_numel = 0 if packed_input_is_compact else self.elastic_param_buffer.layout.padding_waste_numel
+        workspace_persistent = False
         if packed_rank_chunks is not None:
             packed_rank_chunks = self._maybe_to_reduce_dtype(packed_rank_chunks)
         if packed_rank_chunks is not None and packed_input_is_compact and not self._can_owner_broadcast_full_params():
             raise RuntimeError("Compact owner grad buckets require whole-parameter owner shards.")
         workspace_lease = None
         if packed_rank_chunks is None:
-            workspace_lease = self.elastic_param_buffer.workspace.acquire(
-                self._reduce_reference_tensor(),
-                bucket.world_size * bucket.max_shard_size,
-            )
+            packed_input_is_compact = self._can_copy_bucket_to_compact_owner_rank_chunks(bucket)
+            if packed_input_is_compact:
+                workspace_lease = self.elastic_param_buffer.acquire_rank_chunk_workspace(
+                    self._reduce_reference_tensor(),
+                    compact=True,
+                    persistent=True,
+                )
+                workspace_kind = "compact_rank_chunks"
+                workspace_padding_waste_numel = 0
+            else:
+                workspace_lease = self._comm_workspace().acquire(
+                    self._reduce_reference_tensor(),
+                    bucket.world_size * bucket.max_shard_size,
+                )
+                workspace_kind = "padded_rank_chunks"
+                workspace_padding_waste_numel = bucket.world_size * bucket.max_shard_size - sum(bucket.shard_sizes)
             packed_rank_chunks = workspace_lease.tensor
+            workspace_numel = packed_rank_chunks.numel()
+            workspace_persistent = bool(getattr(workspace_lease, "persistent", False))
         copy_in_ms = 0.0
         if needs_copy_in:
             copy_start = perf_counter()
-            fill_reduce_scatter_input(bucket, packed_rank_chunks)
+            if packed_input_is_compact:
+                self._fill_compact_owner_reduce_scatter_input(bucket, packed_rank_chunks)
+                layout_kind = "compact_owner"
+            else:
+                fill_reduce_scatter_input(bucket, packed_rank_chunks)
             copy_in_ms = (perf_counter() - copy_start) * 1000.0
             del bucket
         enqueue_start = perf_counter()
@@ -700,6 +794,7 @@ class MatrixFlatBuffer:
                 collective_numel=handle.collective_numel,
                 collective_bytes=handle.collective_bytes,
                 collective_count=handle.collective_count,
+                collective_sync_mode=handle.collective_sync_mode,
             )
         return GradBucketReduceStart(
             handle=handle,
@@ -710,6 +805,10 @@ class MatrixFlatBuffer:
                 reduce_scatter_enqueue_ms=(perf_counter() - enqueue_start) * 1000.0,
                 packed_numel=packed_rank_chunks.numel(),
                 packed_bytes=packed_rank_chunks.numel() * packed_rank_chunks.element_size(),
+                workspace_kind=workspace_kind,
+                workspace_numel=workspace_numel,
+                workspace_padding_waste_numel=workspace_padding_waste_numel,
+                workspace_persistent=workspace_persistent,
             ),
         )
 
@@ -795,18 +894,38 @@ class MatrixFlatBuffer:
         self.use_local_grad_shard(existing)
         return True
 
-    def clear_full_params(self, *, shrink_storage: bool = False, keep_shrunk_tensor: bool = True) -> None:
+    def clear_full_params(
+        self,
+        *,
+        shrink_storage: bool = False,
+        keep_shrunk_tensor: bool = True,
+    ) -> FullParamClearStats:
+        if self.full_buffer is None:
+            return FullParamClearStats(kind="already_clear")
+        clear_numel = int(self.full_buffer.numel())
+        clear_bytes = int(self.full_buffer.untyped_storage().nbytes())
         if shrink_storage and self.full_buffer is not None:
             if self.full_param_buffer_pool.can_cache(self.full_buffer):
-                self._release_full_buffer_if_inactive()
+                release = self._release_full_buffer_if_inactive()
                 self.full_buffer = None
-                return
+                return FullParamClearStats(
+                    kind=f"released:{release.kind if release is not None else 'skipped'}",
+                    release=release,
+                    numel=clear_numel,
+                    bytes=clear_bytes,
+                )
             self._resize_full_buffer_storage(0)
             if not keep_shrunk_tensor:
                 self.full_buffer = None
-            return
-        self._release_full_buffer_if_inactive()
+            return FullParamClearStats(kind="shrunk", numel=clear_numel, bytes=clear_bytes)
+        release = self._release_full_buffer_if_inactive()
         self.full_buffer = None
+        return FullParamClearStats(
+            kind=f"released:{release.kind if release is not None else 'skipped'}",
+            release=release,
+            numel=clear_numel,
+            bytes=clear_bytes,
+        )
 
     def _resize_full_buffer_storage(self, numel: int) -> None:
         if self.full_buffer is None:
@@ -820,6 +939,12 @@ class MatrixFlatBuffer:
 
     def set_elastic_workspace_cache_limit(self, max_cached_per_key: int) -> None:
         self.elastic_param_buffer.workspace.set_max_cached_per_key(max_cached_per_key)
+        self.static_param_buffer.workspace.set_max_cached_per_key(max_cached_per_key)
+
+    def _comm_workspace(self) -> CommWorkspaceCache:
+        if self._should_use_owner_segment_collectives():
+            return self.elastic_param_buffer.workspace
+        return self.static_param_buffer.workspace
 
     def set_cuda_streams(
         self,
@@ -900,12 +1025,16 @@ class MatrixFlatBuffer:
                 return False
         return True
 
-    def _release_full_buffer_if_inactive(self) -> None:
+    def _release_full_buffer_if_inactive(self) -> FullParamBufferRelease | None:
         if self.full_buffer is None:
-            return
+            return None
         if self.param_data_alias_full_buffer():
-            return
-        self.full_param_buffer_pool.release(self.full_buffer)
+            return FullParamBufferRelease(
+                kind="active_param_view",
+                numel=int(self.full_buffer.numel()),
+                bytes=int(self.full_buffer.untyped_storage().nbytes()),
+            )
+        return self.full_param_buffer_pool.release(self.full_buffer)
 
     def _can_direct_all_gather_full_params(self) -> bool:
         if not hasattr(torch.distributed, "all_gather_into_tensor"):
@@ -973,6 +1102,12 @@ class MatrixFlatBuffer:
             native_sendrecv_chunk_enabled = native_sendrecv_chunk_fast_path_enabled()
             custom_reduce_impl = custom_reduce_scatterv_impl()
 
+        if owner_backend is None:
+            return self.static_param_buffer.communication_summary(
+                param_gather_strategy=self.param_gather_strategy,
+                matrix_collective_backend=self.matrix_collective_backend,
+                can_direct_all_gather=self._can_direct_all_gather_full_params(),
+            )
         return self.elastic_param_buffer.communication_summary(
             param_gather_strategy=self.param_gather_strategy,
             matrix_collective_backend=self.matrix_collective_backend,
@@ -984,28 +1119,40 @@ class MatrixFlatBuffer:
             custom_reduce_scatterv_impl=custom_reduce_impl,
         )
 
-    def owner_segment_prefetch_skip_reason(self) -> str | None:
+    def owner_segment_prefetch_skip_reason(self, *, ordered: bool = False) -> str | None:
         if not self._should_use_owner_segment_collectives():
             return None
         if self._owner_segment_collective_backend() != "custom":
             return None
         from matrix_fsdp.kernels.custom_collectives import custom_allgatherv_owner_prefetch_skip_reason
 
-        return custom_allgatherv_owner_prefetch_skip_reason()
+        return custom_allgatherv_owner_prefetch_skip_reason(rank_segments=self.plan.rank_segments, ordered=ordered)
+
+    def owner_segment_collective_has_independent_comm_lanes(self) -> bool:
+        if not self._should_use_owner_segment_collectives():
+            return False
+        if self._owner_segment_collective_backend() != "custom":
+            return False
+        from matrix_fsdp.kernels.custom_collectives import custom_allgatherv_has_independent_native_comm_lanes
+
+        return custom_allgatherv_has_independent_native_comm_lanes(rank_segments=self.plan.rank_segments)
 
     def owner_segment_prefetch_order_gate_required(self) -> bool:
-        return self._should_use_owner_segment_collectives() and self.owner_segment_prefetch_skip_reason() is None
+        return self._should_use_owner_segment_collectives() and self._owner_segment_collective_backend() == "custom"
 
     def _owner_segment_collective_backend(self) -> str:
         if self.matrix_collective_backend == "custom":
             return "custom"
         return "owner_broadcast"
 
-    def _local_views_by_param(self) -> dict[str, list[LocalParamView]]:
+    def _build_local_views_by_param(self) -> dict[str, list[LocalParamView]]:
         views_by_param: dict[str, list[LocalParamView]] = {}
         for view in self.local_param_views:
             views_by_param.setdefault(view.managed_param.fqn, []).append(view)
         return views_by_param
+
+    def _local_views_by_param(self) -> dict[str, list[LocalParamView]]:
+        return self._local_views_by_param_cache
 
     def _reduce_reference_tensor(self) -> torch.Tensor:
         if self.reduce_dtype is None or self.reduce_dtype == self.local_shard.dtype:
@@ -1057,12 +1204,44 @@ class MatrixFlatBuffer:
             return False
         if max(self.shard_sizes, default=0) == 0:
             return False
-        return all(self._packed_grad_offset_for_param(mp) is not None for mp in self.managed_params)
+        offsets = self._packed_grad_offsets(compact=False)
+        return all(offsets.get(mp.fqn) is not None for mp in self.managed_params)
 
     def _can_use_compact_owner_grad_bucket(self) -> bool:
         if not self._should_use_owner_segment_collectives():
             return False
-        return all(self._packed_grad_offset_for_param(mp, compact=True) is not None for mp in self.managed_params)
+        offsets = self._packed_grad_offsets(compact=True)
+        return all(offsets.get(mp.fqn) is not None for mp in self.managed_params)
+
+    def _can_copy_bucket_to_compact_owner_rank_chunks(self, bucket: MatrixGradBucket) -> bool:
+        if not self._should_use_owner_segment_collectives():
+            return False
+        if bucket.packed_input is not None:
+            return bool(bucket.packed_input_is_compact)
+        offsets = self._packed_grad_offsets(compact=True)
+        return all(offsets.get(param_grad.managed_param.fqn) is not None for param_grad in bucket.param_grads)
+
+    def _fill_compact_owner_reduce_scatter_input(
+        self,
+        bucket: MatrixGradBucket,
+        packed_rank_chunks: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_numel = self.elastic_param_buffer.rank_chunk_workspace_numel(compact=True)
+        if packed_rank_chunks.ndim != 1:
+            raise ValueError(f"packed_rank_chunks must be 1D, got shape {tuple(packed_rank_chunks.shape)}.")
+        if packed_rank_chunks.numel() != expected_numel:
+            raise ValueError(f"packed_rank_chunks has {packed_rank_chunks.numel()} elements, expected {expected_numel}.")
+        packed_rank_chunks.zero_()
+        for param_grad in bucket.param_grads:
+            mp = param_grad.managed_param
+            grad = param_grad.grad.reshape(-1)
+            if grad.numel() != mp.numel:
+                raise RuntimeError(f"Gradient for {mp.fqn} has {grad.numel()} elements, expected {mp.numel}.")
+            view = self._packed_grad_view_for_param(mp, packed_rank_chunks, compact=True)
+            if view is None:
+                raise RuntimeError(f"Gradient for {mp.fqn} cannot be packed into compact owner rank chunks.")
+            view.copy_(grad)
+        return packed_rank_chunks
 
     def _is_single_rank_shard_group(self) -> bool:
         return len(self.shard_sizes) == 1
@@ -1074,6 +1253,17 @@ class MatrixFlatBuffer:
         return packed[offset : offset + mp.numel]
 
     def _packed_grad_offset_for_param(self, mp: ManagedParam, *, compact: bool = False) -> int | None:
+        return self._packed_grad_offsets(compact=compact).get(mp.fqn)
+
+    def _packed_grad_offsets(self, *, compact: bool) -> dict[str, int | None]:
+        cached = self._packed_grad_offset_cache.get(compact)
+        if cached is not None:
+            return cached
+        offsets = {mp.fqn: self._compute_packed_grad_offset_for_param(mp, compact=compact) for mp in self.managed_params}
+        self._packed_grad_offset_cache[compact] = offsets
+        return offsets
+
+    def _compute_packed_grad_offset_for_param(self, mp: ManagedParam, *, compact: bool = False) -> int | None:
         if self.plan.rank_segments is None:
             return None
         max_shard_size = max(self.shard_sizes, default=0)
@@ -1308,7 +1498,7 @@ class MatrixFlatBuffer:
 
 def _release_workspace_after_wait(
     handle: MatrixTensorCollectiveHandle,
-    lease: ElasticParamBufferWorkspaceLease,
+    lease: CommWorkspaceLease | ElasticRankChunkWorkspaceLease,
 ) -> MatrixTensorCollectiveHandle:
     def wait() -> torch.Tensor:
         try:

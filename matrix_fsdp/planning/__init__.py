@@ -3,7 +3,9 @@ from .auto_planner import (
     auto_group_plan,
     build_auto_planner_report,
     format_auto_planner_report,
+    make_cost_aware_muon_shard_aware_group_planner,
     make_muon_shard_aware_group_planner,
+    make_scoped_muon_shard_aware_group_planner,
 )
 from matrix_fsdp.planning.constraints import (
     ParamShardConstraints,
@@ -17,6 +19,7 @@ from matrix_fsdp.planning.planner import (
     expert_owner_tail_plan,
     fsdp2_chunk_plan,
     hinted_ordered_group_plan,
+    load_balanced_matrix_owner_tail_group_plans,
     load_balanced_matrix_owner_tail_plan,
     ordered_matrix_owner_tail_plan,
 )

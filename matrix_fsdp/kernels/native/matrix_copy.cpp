@@ -10,9 +10,10 @@ void copy_rank_segments_to_full_cuda(
 
 void copy_range_cuda(torch::Tensor input_tensor, torch::Tensor output_tensor, int64_t input_offset);
 
+bool nccl_comm_lanes_supported();
 pybind11::bytes get_nccl_unique_id();
-void init_nccl_comm(pybind11::bytes unique_id_bytes, int rank, int world_size);
-void destroy_nccl_comm();
+void init_nccl_comm(pybind11::bytes unique_id_bytes, int rank, int world_size, int lane_id);
+void destroy_nccl_comm(int lane_id);
 void group_broadcast_rank_segments(
     torch::Tensor local_tensor,
     torch::Tensor output_tensor,
@@ -20,7 +21,8 @@ void group_broadcast_rank_segments(
     torch::Tensor global_starts,
     torch::Tensor local_starts,
     torch::Tensor numels,
-    int rank);
+    int rank,
+    int lane_id);
 void sendrecv_rank_segments(
     torch::Tensor local_tensor,
     torch::Tensor output_tensor,
@@ -28,18 +30,21 @@ void sendrecv_rank_segments(
     torch::Tensor global_starts,
     torch::Tensor local_starts,
     torch::Tensor numels,
-    int rank);
+    int rank,
+    int lane_id);
 void sendrecv_rank_chunks(
     torch::Tensor local_tensor,
     torch::Tensor output_tensor,
     torch::Tensor shard_sizes,
-    int rank);
+    int rank,
+    int lane_id);
 void reduce_rank_chunks(
     torch::Tensor packed_rank_chunks,
     torch::Tensor local_output,
     torch::Tensor shard_sizes,
     int rank,
-    bool compact);
+    bool compact,
+    int lane_id);
 
 #define MATRIX_CHECK_CUDA(tensor) TORCH_CHECK((tensor).is_cuda(), #tensor " must be a CUDA tensor")
 #define MATRIX_CHECK_CONTIGUOUS(tensor) TORCH_CHECK((tensor).is_contiguous(), #tensor " must be contiguous")
@@ -96,11 +101,62 @@ void copy_range(torch::Tensor input_tensor, torch::Tensor output_tensor, int64_t
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("copy_rank_segments_to_full", &copy_rank_segments_to_full, "Copy rank-owned segments into full buffer");
   m.def("copy_range", &copy_range, "Copy a contiguous 1D range into an output tensor");
+  m.def("nccl_comm_lanes_supported", &nccl_comm_lanes_supported, "Whether native NCCL communicator lanes are supported");
   m.def("get_nccl_unique_id", &get_nccl_unique_id, "Create a native NCCL unique id");
-  m.def("init_nccl_comm", &init_nccl_comm, "Initialize the native MatrixFSDP NCCL communicator");
-  m.def("destroy_nccl_comm", &destroy_nccl_comm, "Destroy the native MatrixFSDP NCCL communicator");
-  m.def("group_broadcast_rank_segments", &group_broadcast_rank_segments, "Grouped NCCL broadcasts for rank segments");
-  m.def("sendrecv_rank_segments", &sendrecv_rank_segments, "Grouped NCCL send/recv allgatherv for rank segments");
-  m.def("sendrecv_rank_chunks", &sendrecv_rank_chunks, "Grouped NCCL send/recv allgatherv for contiguous rank chunks");
-  m.def("reduce_rank_chunks", &reduce_rank_chunks, "Grouped NCCL reduce-scatterv for contiguous rank chunks");
+  m.def(
+      "init_nccl_comm",
+      &init_nccl_comm,
+      "Initialize a native MatrixFSDP NCCL communicator lane",
+      pybind11::arg("unique_id_bytes"),
+      pybind11::arg("rank"),
+      pybind11::arg("world_size"),
+      pybind11::arg("lane_id") = 0);
+  m.def(
+      "destroy_nccl_comm",
+      &destroy_nccl_comm,
+      "Destroy one native MatrixFSDP NCCL communicator lane or all lanes",
+      pybind11::arg("lane_id") = -1);
+  m.def(
+      "group_broadcast_rank_segments",
+      &group_broadcast_rank_segments,
+      "Grouped NCCL broadcasts for rank segments",
+      pybind11::arg("local_tensor"),
+      pybind11::arg("output_tensor"),
+      pybind11::arg("src_ranks"),
+      pybind11::arg("global_starts"),
+      pybind11::arg("local_starts"),
+      pybind11::arg("numels"),
+      pybind11::arg("rank"),
+      pybind11::arg("lane_id") = 0);
+  m.def(
+      "sendrecv_rank_segments",
+      &sendrecv_rank_segments,
+      "Grouped NCCL send/recv allgatherv for rank segments",
+      pybind11::arg("local_tensor"),
+      pybind11::arg("output_tensor"),
+      pybind11::arg("src_ranks"),
+      pybind11::arg("global_starts"),
+      pybind11::arg("local_starts"),
+      pybind11::arg("numels"),
+      pybind11::arg("rank"),
+      pybind11::arg("lane_id") = 0);
+  m.def(
+      "sendrecv_rank_chunks",
+      &sendrecv_rank_chunks,
+      "Grouped NCCL send/recv allgatherv for contiguous rank chunks",
+      pybind11::arg("local_tensor"),
+      pybind11::arg("output_tensor"),
+      pybind11::arg("shard_sizes"),
+      pybind11::arg("rank"),
+      pybind11::arg("lane_id") = 0);
+  m.def(
+      "reduce_rank_chunks",
+      &reduce_rank_chunks,
+      "Grouped NCCL reduce-scatterv for contiguous rank chunks",
+      pybind11::arg("packed_rank_chunks"),
+      pybind11::arg("local_output"),
+      pybind11::arg("shard_sizes"),
+      pybind11::arg("rank"),
+      pybind11::arg("compact"),
+      pybind11::arg("lane_id") = 0);
 }

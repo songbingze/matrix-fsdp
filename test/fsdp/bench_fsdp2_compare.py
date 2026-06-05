@@ -98,7 +98,14 @@ EXPERIMENTAL_MODES = (
     "matrix_owner_muon_role_greedy_matrix_all_gather",
     "matrix_owner_muon_role_greedy_matrix_all_gather_pre_backward",
     "matrix_owner_muon_role_greedy_custom_collective",
+    "matrix_owner_muon_role_greedy_custom_collective_prefetch_cap2",
+    "matrix_owner_muon_role_greedy_custom_collective_copy_in",
+    "matrix_owner_muon_role_greedy_custom_collective_zero_copy_grad_bucket",
     "matrix_owner_muon_role_greedy_custom_collective_pre_backward",
+    "matrix_owner_muon_scope_greedy_custom_collective",
+    "matrix_owner_muon_scope_greedy_custom_collective_pre_backward",
+    "matrix_owner_muon_cost_aware_custom_collective",
+    "matrix_owner_muon_cost_aware_custom_collective_pre_backward",
 )
 
 @dataclass(frozen=True)
@@ -116,12 +123,14 @@ class FSDP2CompareConfig:
     model: str = "mlp"
     seq_len: int = 128
     heads: int = 8
+    block_group_size: int = 1
     warmup_steps: int = 5
     profile_steps: int = 3
     profile_memory_limit_mb: float = 0.0
     matrix_max_active_full_param_buffers: int | None = None
     matrix_max_active_full_param_numel: int | None = None
     matrix_max_active_full_param_memory_mb: float = 0.0
+    matrix_max_cached_elastic_workspaces_per_key: int = 0
     activation_checkpoint: bool = False
     checkpoint_use_reentrant: bool = False
     activation_checkpoint_wrapper: bool = False
@@ -151,6 +160,7 @@ class FSDP2CompareRow:
     seq_len: int = 128
     heads: int = 8
     prefetch_budget: str = ""
+    block_group_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -170,6 +180,7 @@ class FSDP2MemoryTraceRow:
     model: str = "mlp"
     seq_len: int = 128
     prefetch_budget: str = ""
+    block_group_size: int = 1
     active_full_param_buffers: int = 0
     full_param_buffer_mb: float = 0.0
     local_shard_mb: float = 0.0
@@ -197,6 +208,7 @@ class FSDP2PhaseTimingRow:
     model: str = "mlp"
     seq_len: int = 128
     prefetch_budget: str = ""
+    block_group_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -226,10 +238,12 @@ class MatrixRuntimeCommunicationRow:
     workspace_acquires: int
     workspace_reuses: int
     workspace_allocates: int
+    workspace_cache_limit: int
     max_workspace_allocated_numel: int
     min_shard_size: int
     max_shard_size: int
     seq_len: int = 128
+    block_group_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -296,6 +310,44 @@ class MLPBlock(nn.Module):
         return self.down(self.act(self.up(x)))
 
 
+class BlockGroup(nn.Module):
+    def __init__(
+        self,
+        layers: Sequence[nn.Module],
+        *,
+        activation_checkpoint: bool = False,
+        checkpoint_use_reentrant: bool = False,
+    ) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(layers)
+        self.activation_checkpoint = activation_checkpoint
+        self.checkpoint_use_reentrant = checkpoint_use_reentrant
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = _checkpoint_layer(layer, x, self.checkpoint_use_reentrant) if self.activation_checkpoint else layer(x)
+        return x
+
+
+def _group_layers(
+    layers: Sequence[nn.Module],
+    block_group_size: int,
+    *,
+    activation_checkpoint: bool,
+    checkpoint_use_reentrant: bool,
+) -> list[nn.Module]:
+    if block_group_size <= 1:
+        return list(layers)
+    return [
+        BlockGroup(
+            layers[index : index + block_group_size],
+            activation_checkpoint=activation_checkpoint,
+            checkpoint_use_reentrant=checkpoint_use_reentrant,
+        )
+        for index in range(0, len(layers), block_group_size)
+    ]
+
+
 class SplitGELUMLPBlock(nn.Module):
     def __init__(self, hidden: int, intermediate: int) -> None:
         super().__init__()
@@ -321,10 +373,18 @@ class MLPStack(nn.Module):
         *,
         activation_checkpoint: bool = False,
         checkpoint_use_reentrant: bool = False,
+        block_group_size: int = 1,
     ) -> None:
         super().__init__()
-        self.layers = nn.ModuleList([MLPBlock(hidden, intermediate) for _ in range(layers)])
-        self.activation_checkpoint = activation_checkpoint
+        self.layers = nn.ModuleList(
+            _group_layers(
+                [MLPBlock(hidden, intermediate) for _ in range(layers)],
+                block_group_size,
+                activation_checkpoint=activation_checkpoint,
+                checkpoint_use_reentrant=checkpoint_use_reentrant,
+            )
+        )
+        self.activation_checkpoint = activation_checkpoint and block_group_size <= 1
         self.checkpoint_use_reentrant = checkpoint_use_reentrant
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -369,11 +429,19 @@ class TransformerStack(nn.Module):
         *,
         activation_checkpoint: bool = False,
         checkpoint_use_reentrant: bool = False,
+        block_group_size: int = 1,
     ) -> None:
         super().__init__()
-        self.layers = nn.ModuleList([TransformerBlock(hidden, intermediate, heads) for _ in range(layers)])
+        self.layers = nn.ModuleList(
+            _group_layers(
+                [TransformerBlock(hidden, intermediate, heads) for _ in range(layers)],
+                block_group_size,
+                activation_checkpoint=activation_checkpoint,
+                checkpoint_use_reentrant=checkpoint_use_reentrant,
+            )
+        )
         self.norm = nn.LayerNorm(hidden)
-        self.activation_checkpoint = activation_checkpoint
+        self.activation_checkpoint = activation_checkpoint and block_group_size <= 1
         self.checkpoint_use_reentrant = checkpoint_use_reentrant
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -422,11 +490,19 @@ class SplitQKVTransformerStack(nn.Module):
         *,
         activation_checkpoint: bool = False,
         checkpoint_use_reentrant: bool = False,
+        block_group_size: int = 1,
     ) -> None:
         super().__init__()
-        self.layers = nn.ModuleList([SplitQKVTransformerBlock(hidden, intermediate, heads) for _ in range(layers)])
+        self.layers = nn.ModuleList(
+            _group_layers(
+                [SplitQKVTransformerBlock(hidden, intermediate, heads) for _ in range(layers)],
+                block_group_size,
+                activation_checkpoint=activation_checkpoint,
+                checkpoint_use_reentrant=checkpoint_use_reentrant,
+            )
+        )
         self.norm = nn.LayerNorm(hidden)
-        self.activation_checkpoint = activation_checkpoint
+        self.activation_checkpoint = activation_checkpoint and block_group_size <= 1
         self.checkpoint_use_reentrant = checkpoint_use_reentrant
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -628,6 +704,7 @@ def format_compare_table(rows: Sequence[FSDP2CompareRow]) -> str:
         "mode",
         "model",
         "unit",
+        "group",
         "device",
         "world",
         "layers",
@@ -647,6 +724,7 @@ def format_compare_table(rows: Sequence[FSDP2CompareRow]) -> str:
             row.mode,
             row.model,
             row.unit,
+            str(row.block_group_size),
             row.device,
             str(row.world_size),
             str(row.layers),
@@ -678,6 +756,7 @@ def format_memory_trace_table(rows: Sequence[FSDP2MemoryTraceRow]) -> str:
         "rank",
         "model",
         "unit",
+        "group",
         "device",
         "world",
         "optim",
@@ -704,6 +783,7 @@ def format_memory_trace_table(rows: Sequence[FSDP2MemoryTraceRow]) -> str:
             "max" if row.rank < 0 else str(row.rank),
             row.model,
             row.unit,
+            str(row.block_group_size),
             row.device,
             str(row.world_size),
             row.optimizer,
@@ -740,6 +820,7 @@ def format_phase_timing_table(rows: Sequence[FSDP2PhaseTimingRow]) -> str:
         "mode",
         "model",
         "unit",
+        "group",
         "device",
         "world",
         "optim",
@@ -758,6 +839,7 @@ def format_phase_timing_table(rows: Sequence[FSDP2PhaseTimingRow]) -> str:
             row.mode,
             row.model,
             row.unit,
+            str(row.block_group_size),
             row.device,
             str(row.world_size),
             row.optimizer,
@@ -787,6 +869,7 @@ def format_runtime_communication_table(rows: Sequence[MatrixRuntimeCommunication
         "mode",
         "model",
         "unit",
+        "group",
         "device",
         "world",
         "optim",
@@ -810,6 +893,7 @@ def format_runtime_communication_table(rows: Sequence[MatrixRuntimeCommunication
         "workspace_acq",
         "workspace_reuse",
         "workspace_alloc",
+        "workspace_cache",
         "workspace_alloc_numel",
         "min_shard",
         "max_shard",
@@ -819,6 +903,7 @@ def format_runtime_communication_table(rows: Sequence[MatrixRuntimeCommunication
             row.mode,
             row.model,
             row.unit,
+            str(row.block_group_size),
             row.device,
             str(row.world_size),
             row.optimizer,
@@ -842,6 +927,7 @@ def format_runtime_communication_table(rows: Sequence[MatrixRuntimeCommunication
             str(row.workspace_acquires),
             str(row.workspace_reuses),
             str(row.workspace_allocates),
+            str(row.workspace_cache_limit),
             str(row.max_workspace_allocated_numel),
             str(row.min_shard_size),
             str(row.max_shard_size),
@@ -1129,7 +1215,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "matrix_owner_muon_role_greedy_matrix_all_gather",
             "matrix_owner_muon_role_greedy_matrix_all_gather_pre_backward",
             "matrix_owner_muon_role_greedy_custom_collective",
+            "matrix_owner_muon_role_greedy_custom_collective_copy_in",
+            "matrix_owner_muon_role_greedy_custom_collective_zero_copy_grad_bucket",
             "matrix_owner_muon_role_greedy_custom_collective_pre_backward",
+            "matrix_owner_muon_scope_greedy_custom_collective",
+            "matrix_owner_muon_scope_greedy_custom_collective_pre_backward",
+            "matrix_owner_muon_cost_aware_custom_collective",
+            "matrix_owner_muon_cost_aware_custom_collective_pre_backward",
         ),
         help="Mode to benchmark. Can be passed multiple times.",
     )
@@ -1140,6 +1232,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--intermediate", type=int, default=2048)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument(
+        "--block-group-size",
+        type=int,
+        default=1,
+        help="For --unit block, shard this many adjacent benchmark blocks as one FSDP unit.",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--optimizer", choices=("sgd", "adamw", "muon"), default="sgd")
     parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"), default="float32")
@@ -1149,6 +1247,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--matrix-max-active-full-param-buffers", type=int, default=None)
     parser.add_argument("--matrix-max-active-full-param-numel", type=int, default=None)
     parser.add_argument("--matrix-max-active-full-param-memory-mb", type=float, default=0.0)
+    parser.add_argument(
+        "--matrix-max-cached-elastic-workspaces-per-key",
+        type=int,
+        default=0,
+        help=(
+            "Keep this many elastic communication workspaces cached per shape/dtype/device key. "
+            "This is useful for custom owner-segment Muon collectives where repeated workspace "
+            "allocation can dominate short-step benchmarks."
+        ),
+    )
     parser.add_argument("--activation-checkpoint", action="store_true", help="Checkpoint each benchmark block/layer.")
     parser.add_argument(
         "--activation-checkpoint-wrapper",
@@ -1227,6 +1335,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         model=args.model,
         seq_len=args.seq_len,
         heads=args.heads,
+        block_group_size=args.block_group_size,
         batch_size=args.batch_size,
         optimizer=args.optimizer,
         dtype=args.dtype,
@@ -1236,6 +1345,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         matrix_max_active_full_param_buffers=args.matrix_max_active_full_param_buffers,
         matrix_max_active_full_param_numel=args.matrix_max_active_full_param_numel,
         matrix_max_active_full_param_memory_mb=args.matrix_max_active_full_param_memory_mb,
+        matrix_max_cached_elastic_workspaces_per_key=args.matrix_max_cached_elastic_workspaces_per_key,
         activation_checkpoint=args.activation_checkpoint,
         checkpoint_use_reentrant=args.checkpoint_use_reentrant,
         activation_checkpoint_wrapper=args.activation_checkpoint_wrapper,
@@ -1586,6 +1696,7 @@ def _benchmark_mode(
         seq_len=config.seq_len,
         heads=config.heads,
         prefetch_budget=prefetch_budget,
+        block_group_size=config.block_group_size,
     )
 
 
@@ -1661,6 +1772,7 @@ def _phase_timing_mode(
         model=config.model,
         seq_len=config.seq_len,
         prefetch_budget=prefetch_budget,
+        block_group_size=config.block_group_size,
     )
 
 
@@ -1695,6 +1807,7 @@ def _runtime_communication_summary_mode(
             "workspace_total_acquire_count": 0,
             "workspace_total_reuse_count": 0,
             "workspace_total_allocate_count": 0,
+            "max_workspace_cache_limit": 0,
             "max_workspace_allocated_numel": 0,
             "max_shard_size": 0,
             "min_shard_size": 0,
@@ -1732,10 +1845,12 @@ def _runtime_communication_summary_mode(
         workspace_acquires=int(communication_summary["workspace_total_acquire_count"]),
         workspace_reuses=int(communication_summary["workspace_total_reuse_count"]),
         workspace_allocates=int(communication_summary["workspace_total_allocate_count"]),
+        workspace_cache_limit=int(communication_summary.get("max_workspace_cache_limit", 0)),
         max_workspace_allocated_numel=int(communication_summary["max_workspace_allocated_numel"]),
         min_shard_size=int(communication_summary["min_shard_size"]),
         max_shard_size=int(communication_summary["max_shard_size"]),
         seq_len=config.seq_len,
+        block_group_size=config.block_group_size,
     )
 
 
@@ -1993,6 +2108,7 @@ def _memory_trace_row(
         model=config.model,
         seq_len=config.seq_len,
         prefetch_budget=_prefetch_budget(optimizer),
+        block_group_size=config.block_group_size,
         active_full_param_buffers=int(reduced_values[4].item()),
         full_param_buffer_mb=reduced_values[5].item(),
         local_shard_mb=reduced_values[6].item(),
@@ -2068,7 +2184,11 @@ def _prepare_mode(
             backward_reduce_strategy="bucket_reduce_scatter",
             runtime_trace_enabled=False,
         )
-        optimizer = MatrixFSDPOptimizer(_make_optimizer(sharded_model.parameters(), config), sharded_model)
+        optimizer = MatrixFSDPOptimizer(
+            _make_optimizer(sharded_model.parameters(), config),
+            sharded_model,
+            max_cached_elastic_workspaces_per_key=config.matrix_max_cached_elastic_workspaces_per_key,
+        )
         return sharded_model, optimizer
     if mode == "matrix_optimizer_finalize":
         sharded_model = matrix_fully_shard(
@@ -2079,7 +2199,11 @@ def _prepare_mode(
             finalize_after_backward=False,
             runtime_trace_enabled=False,
         )
-        optimizer = MatrixFSDPOptimizer(_make_optimizer(sharded_model.parameters(), config), sharded_model)
+        optimizer = MatrixFSDPOptimizer(
+            _make_optimizer(sharded_model.parameters(), config),
+            sharded_model,
+            max_cached_elastic_workspaces_per_key=config.matrix_max_cached_elastic_workspaces_per_key,
+        )
         return sharded_model, optimizer
     if mode == "matrix_auto_finalize":
         sharded_model = matrix_fully_shard(
@@ -2090,7 +2214,11 @@ def _prepare_mode(
             finalize_after_backward=True,
             runtime_trace_enabled=False,
         )
-        optimizer = MatrixFSDPOptimizer(_make_optimizer(sharded_model.parameters(), config), sharded_model)
+        optimizer = MatrixFSDPOptimizer(
+            _make_optimizer(sharded_model.parameters(), config),
+            sharded_model,
+            max_cached_elastic_workspaces_per_key=config.matrix_max_cached_elastic_workspaces_per_key,
+        )
         return sharded_model, optimizer
     if mode == "matrix_prefetch":
         return _prepare_matrix_prefetch(model, mesh, config)
@@ -2260,12 +2388,75 @@ def _prepare_mode(
             owner_assignment="role_greedy",
             matrix_collective_backend="custom",
         )
+    if mode == "matrix_owner_muon_role_greedy_custom_collective_prefetch_cap2":
+        return _prepare_matrix_owner_muon(
+            model,
+            mesh,
+            config,
+            owner_assignment="role_greedy",
+            matrix_collective_backend="custom",
+            max_unsharded_prefetch_units=2,
+            max_backward_prefetch_units=2,
+            max_active_full_param_buffers=2,
+        )
+    if mode == "matrix_owner_muon_role_greedy_custom_collective_copy_in":
+        return _prepare_matrix_owner_muon(
+            model,
+            mesh,
+            config,
+            owner_assignment="role_greedy",
+            matrix_collective_backend="custom",
+            use_zero_copy_grad_bucket=False,
+        )
+    if mode == "matrix_owner_muon_role_greedy_custom_collective_zero_copy_grad_bucket":
+        return _prepare_matrix_owner_muon(
+            model,
+            mesh,
+            config,
+            owner_assignment="role_greedy",
+            matrix_collective_backend="custom",
+            use_zero_copy_grad_bucket=True,
+        )
     if mode == "matrix_owner_muon_role_greedy_custom_collective_pre_backward":
         return _prepare_matrix_owner_muon(
             model,
             mesh,
             config,
             owner_assignment="role_greedy",
+            backward_prefetch_timing="pre_backward",
+            matrix_collective_backend="custom",
+        )
+    if mode == "matrix_owner_muon_scope_greedy_custom_collective":
+        return _prepare_matrix_owner_muon(
+            model,
+            mesh,
+            config,
+            owner_assignment="scope_greedy",
+            matrix_collective_backend="custom",
+        )
+    if mode == "matrix_owner_muon_scope_greedy_custom_collective_pre_backward":
+        return _prepare_matrix_owner_muon(
+            model,
+            mesh,
+            config,
+            owner_assignment="scope_greedy",
+            backward_prefetch_timing="pre_backward",
+            matrix_collective_backend="custom",
+        )
+    if mode == "matrix_owner_muon_cost_aware_custom_collective":
+        return _prepare_matrix_owner_muon(
+            model,
+            mesh,
+            config,
+            owner_assignment="cost_aware",
+            matrix_collective_backend="custom",
+        )
+    if mode == "matrix_owner_muon_cost_aware_custom_collective_pre_backward":
+        return _prepare_matrix_owner_muon(
+            model,
+            mesh,
+            config,
+            owner_assignment="cost_aware",
             backward_prefetch_timing="pre_backward",
             matrix_collective_backend="custom",
         )
@@ -2325,6 +2516,7 @@ def _prepare_matrix_prefetch(
         max_active_full_param_numel=max_active_full_param_numel,
         max_active_full_param_memory_mb=max_active_full_param_memory_mb,
         max_pending_backward_reduces=max_pending_backward_reduces,
+        max_cached_elastic_workspaces_per_key=config.matrix_max_cached_elastic_workspaces_per_key,
     )
     return sharded_model, optimizer
 
@@ -2338,11 +2530,19 @@ def _prepare_matrix_owner_muon(
     backward_prefetch_timing: str = "post_reshard",
     param_gather_strategy: str = "auto",
     matrix_collective_backend: str = "owner_broadcast",
+    use_zero_copy_grad_bucket: bool = False,
+    max_unsharded_prefetch_units: int | None = 1,
+    max_backward_prefetch_units: int | None = None,
+    max_active_full_param_buffers: int | None = None,
 ) -> tuple[nn.Module, MatrixFSDPOptimizer]:
     if config.optimizer != "muon":
         raise ValueError("matrix_owner_muon modes require --optimizer muon.")
 
-    group_planner = make_muon_shard_aware_group_planner(owner_assignment=owner_assignment)
+    group_planner = (
+        None
+        if owner_assignment in {"scope_greedy", "cost_aware"}
+        else make_muon_shard_aware_group_planner(owner_assignment=owner_assignment)
+    )
 
     sharded_model = matrix_fully_shard(
         model,
@@ -2350,6 +2550,8 @@ def _prepare_matrix_owner_muon(
         wrap_policy=_wrap_policy(config),
         auto_shard_hints=True,
         group_planner=group_planner,
+        auto_planner_policy="muon_shard_aware" if owner_assignment in {"scope_greedy", "cost_aware"} else None,
+        owner_assignment=owner_assignment,
         reshard_after_forward=True,
         forward_prefetch=True,
         backward_prefetch=True,
@@ -2357,15 +2559,18 @@ def _prepare_matrix_owner_muon(
         backward_reduce_strategy="bucket_reduce_scatter",
         runtime_trace_enabled=False,
         use_saved_tensor_hooks=False,
-        use_zero_copy_grad_bucket=True,
+        use_zero_copy_grad_bucket=use_zero_copy_grad_bucket,
         param_gather_strategy=param_gather_strategy,
         matrix_collective_backend=matrix_collective_backend,
     )
     optimizer = MatrixFSDPOptimizer(
         _make_optimizer(sharded_model.parameters(), config),
         sharded_model,
-        max_unsharded_prefetch_units=1,
+        max_unsharded_prefetch_units=max_unsharded_prefetch_units,
+        max_backward_prefetch_units=max_backward_prefetch_units,
         backward_prefetch_timing=backward_prefetch_timing,  # type: ignore[arg-type]
+        max_active_full_param_buffers=max_active_full_param_buffers,
+        max_cached_elastic_workspaces_per_key=config.matrix_max_cached_elastic_workspaces_per_key,
     )
     return sharded_model, optimizer
 
@@ -2430,6 +2635,9 @@ def _prefetch_budget(optimizer: torch.optim.Optimizer | MatrixFSDPOptimizer) -> 
         parts.append(f"full_numel={full_numel_limit}")
     if full_bytes_limit is not None:
         parts.append(f"full_mb={full_bytes_limit / (1024 * 1024):.1f}")
+    elastic_cache_limit = getattr(scheduler, "max_cached_elastic_workspaces_per_key", 0)
+    if elastic_cache_limit:
+        parts.append(f"elastic_ws={elastic_cache_limit}")
     return ",".join(parts)
 
 
@@ -2618,6 +2826,7 @@ def _make_model(config: FSDP2CompareConfig) -> nn.Module:
             config.intermediate,
             activation_checkpoint=use_inline_checkpoint,
             checkpoint_use_reentrant=config.checkpoint_use_reentrant,
+            block_group_size=config.block_group_size,
         )
     elif config.model == "transformer":
         model = TransformerStack(
@@ -2627,6 +2836,7 @@ def _make_model(config: FSDP2CompareConfig) -> nn.Module:
             config.heads,
             activation_checkpoint=use_inline_checkpoint,
             checkpoint_use_reentrant=config.checkpoint_use_reentrant,
+            block_group_size=config.block_group_size,
         )
     elif config.model == "transformer_split_qkv":
         model = SplitQKVTransformerStack(
@@ -2636,6 +2846,7 @@ def _make_model(config: FSDP2CompareConfig) -> nn.Module:
             config.heads,
             activation_checkpoint=use_inline_checkpoint,
             checkpoint_use_reentrant=config.checkpoint_use_reentrant,
+            block_group_size=config.block_group_size,
         )
     else:
         raise ValueError(f"Unknown model: {config.model}.")
@@ -2686,6 +2897,10 @@ def _validate_model_config(config: FSDP2CompareConfig) -> None:
         raise ValueError(f"seq_len must be positive, got {config.seq_len}.")
     if config.heads <= 0:
         raise ValueError(f"heads must be positive, got {config.heads}.")
+    if config.block_group_size <= 0:
+        raise ValueError(f"block_group_size must be positive, got {config.block_group_size}.")
+    if config.unit != "block" and config.block_group_size != 1:
+        raise ValueError("--block-group-size is only supported with --unit block.")
     if config.matrix_max_active_full_param_buffers is not None and config.matrix_max_active_full_param_buffers <= 0:
         raise ValueError("matrix_max_active_full_param_buffers must be positive.")
     if config.matrix_max_active_full_param_numel is not None and config.matrix_max_active_full_param_numel <= 0:
@@ -2704,6 +2919,8 @@ def _wrap_policy(config: FSDP2CompareConfig):
 
 
 def _is_unit(module: nn.Module, config: FSDP2CompareConfig) -> bool:
+    if config.unit == "block" and config.block_group_size > 1:
+        return isinstance(module, BlockGroup)
     if config.unit == "linear":
         return isinstance(module, nn.Linear)
     if config.unit == "block" and config.model == "mlp":

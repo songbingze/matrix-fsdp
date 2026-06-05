@@ -233,6 +233,7 @@ class PreparedMatrixOptimizer:
         return None
 
     def _step_post_hook(self, optimizer: Optimizer, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        self.scheduler.record_post_optimizer_event()
         self.scheduler.maybe_trim_cuda_cache()
 
     def _zero_grad(self, *args: Any, **kwargs: Any) -> None:
@@ -504,6 +505,7 @@ class MixedMuonAdamWOptimizer:
             result = result if result is not None else adamw_result
         if self._matrix_lifecycle_enabled:
             assert self.scheduler is not None
+            self.scheduler.record_post_optimizer_event()
             self.scheduler.maybe_trim_cuda_cache()
         return result
 
@@ -948,6 +950,7 @@ def _prepare_matrix_optimizer_step(
     fsdp_param_groups: Iterable[MatrixFSDPParamGroup],
     scheduler: MatrixFSDPScheduler,
 ) -> None:
+    fsdp_param_groups = tuple(fsdp_param_groups)
     scheduler.wait_pending_backward_reduce()
     for unit in fsdp_param_groups:
         if unit.has_pending_backward_reduce:
@@ -958,6 +961,8 @@ def _prepare_matrix_optimizer_step(
         if unit.lifecycle_state == FSDPLifecycleState.SHARDED and not _unit_has_grad(unit):
             continue
         unit.finalize_backward()
+    for unit in fsdp_param_groups:
+        unit.assert_optimizer_ready("optimizer.step")
     scheduler.finish_backward_iteration()
 
 
@@ -1124,6 +1129,7 @@ class MatrixFSDPOptimizer:
             flat_adamw_state=self.flat_adamw_state,
         )
         result = self.optimizer.step()
+        self.scheduler.record_post_optimizer_event()
         self.scheduler.maybe_trim_cuda_cache()
         return result
 

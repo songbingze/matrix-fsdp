@@ -63,6 +63,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "matrix_owner_muon_role_greedy",
             "matrix_owner_muon_role_greedy_pre_backward",
             "matrix_owner_muon_role_greedy_custom_collective",
+            "matrix_owner_muon_role_greedy_custom_collective_copy_in",
+            "matrix_owner_muon_role_greedy_custom_collective_zero_copy_grad_bucket",
             "matrix_owner_muon_role_greedy_custom_collective_pre_backward",
         ),
     )
@@ -77,6 +79,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="native_reduce",
         choices=("native_reduce", "uneven_reduce_scatter", "reduce"),
         help="Custom MatrixFSDP reduce-scatterv implementation for the Matrix Muon mode.",
+    )
+    parser.add_argument(
+        "--matrix-workspace-cache-per-key",
+        type=int,
+        default=1,
+        help="Elastic workspace cache entries per shape/dtype/device key for the Matrix Muon mode.",
     )
     parser.add_argument("--output-json", default="", help="Optional path to write combined phase timing rows.")
     parser.add_argument("--json-config", action="store_true", help="Print the two resolved benchmark configs.")
@@ -117,6 +125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         **common,
         modes=(args.matrix_mode,),
         optimizer="muon",
+        matrix_max_cached_elastic_workspaces_per_key=args.matrix_workspace_cache_per_key,
     )
 
     if args.json_config:

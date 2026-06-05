@@ -60,6 +60,9 @@ class PlannerCostWeights:
     total_comm_byte: float = 0.0
     max_rank_comm_byte: float = 0.0
     comm_imbalance_byte: float = 0.0
+    workspace_preferred_unit: float = 0.0
+    workspace_padding_unit: float = 0.0
+    workspace_padding_ratio: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,9 @@ class PlannerResourceEstimate:
     muon_param_imbalance_bytes: int
     max_rank_comm_bytes: int
     comm_imbalance_bytes: int
+    workspace_preferred_numel: int
+    workspace_padding_waste_numel: int
+    workspace_padding_waste_ratio: float
 
     @classmethod
     def empty(cls, world_size: int = 0) -> "PlannerResourceEstimate":
@@ -111,6 +117,9 @@ class PlannerResourceEstimate:
             muon_param_imbalance_bytes=0,
             max_rank_comm_bytes=0,
             comm_imbalance_bytes=0,
+            workspace_preferred_numel=0,
+            workspace_padding_waste_numel=0,
+            workspace_padding_waste_ratio=0.0,
         )
 
     def as_metadata(self) -> dict[str, object]:
@@ -136,6 +145,9 @@ class PlannerResourceEstimate:
             "muon_param_imbalance_bytes": self.muon_param_imbalance_bytes,
             "max_rank_comm_bytes": self.max_rank_comm_bytes,
             "comm_imbalance_bytes": self.comm_imbalance_bytes,
+            "workspace_preferred_numel": self.workspace_preferred_numel,
+            "workspace_padding_waste_numel": self.workspace_padding_waste_numel,
+            "workspace_padding_waste_ratio": self.workspace_padding_waste_ratio,
         }
 
 
@@ -642,6 +654,9 @@ def estimate_layout_cost_breakdown(
         "total_comm_byte": weights.total_comm_byte * resources.total_comm_bytes,
         "max_rank_comm_byte": weights.max_rank_comm_byte * resources.max_rank_comm_bytes,
         "comm_imbalance_byte": weights.comm_imbalance_byte * resources.comm_imbalance_bytes,
+        "workspace_preferred_unit": weights.workspace_preferred_unit * resources.workspace_preferred_numel,
+        "workspace_padding_unit": weights.workspace_padding_unit * resources.workspace_padding_waste_numel,
+        "workspace_padding_ratio": weights.workspace_padding_ratio * resources.workspace_padding_waste_ratio,
     }
     return PlannerCostBreakdown({name: value for name, value in terms.items() if value != 0.0})
 
@@ -693,6 +708,9 @@ def estimate_layout_resources(
     total_param_bytes = sum(rank_param_bytes)
     total_grad_bytes = sum(rank_grad_bytes)
     total_optimizer_bytes = sum(rank_optimizer_bytes)
+    workspace_preferred_numel = _workspace_preferred_numel(layout)
+    workspace_padding_waste_numel = max(workspace_preferred_numel - layout.total_numel, 0)
+    workspace_padding_waste_ratio = workspace_padding_waste_numel / layout.total_numel if layout.total_numel else 0.0
     rank_memory_bytes = tuple(
         param_bytes + grad_bytes + optimizer_bytes
         for param_bytes, grad_bytes, optimizer_bytes in zip(
@@ -725,7 +743,17 @@ def estimate_layout_resources(
         muon_param_imbalance_bytes=_imbalance(rank_muon_param_bytes),
         max_rank_comm_bytes=max(rank_comm_bytes, default=0),
         comm_imbalance_bytes=_imbalance(rank_comm_bytes),
+        workspace_preferred_numel=workspace_preferred_numel,
+        workspace_padding_waste_numel=workspace_padding_waste_numel,
+        workspace_padding_waste_ratio=workspace_padding_waste_ratio,
     )
+
+
+def _workspace_preferred_numel(layout: MatrixGroupLayout) -> int:
+    if layout.world_size <= 1:
+        return layout.total_numel
+    max_shard_size = max(layout.shard_sizes, default=0)
+    return layout.world_size * max_shard_size
 
 
 def _dtype_element_size(dtype: torch.dtype) -> int:

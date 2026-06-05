@@ -7,17 +7,23 @@ from .planning.auto_planner import (
     auto_group_plan,
     build_auto_planner_report,
     format_auto_planner_report,
+    make_cost_aware_muon_shard_aware_group_planner,
     make_muon_shard_aware_group_planner,
+    make_scoped_muon_shard_aware_group_planner,
 )
 from .runtime.buffer_pool import FullParamBufferPool, clear_global_full_param_buffer_pool
 from .runtime.elastic_param_buffer import (
+    ElasticCommunicationPlan,
     ElasticParamBuffer,
     ElasticParamBufferLayout,
     ElasticParamBufferWorkspace,
     ElasticParamBufferWorkspaceLease,
     ElasticParamBufferWorkspacePlan,
+    ElasticRankChunk,
     rank_segments_are_rank_contiguous_chunks,
 )
+from .runtime.static_param_buffer import StaticParamBuffer, StaticParamBufferLayout, StaticParamBufferWorkspacePlan
+from .runtime.workspace_cache import CommWorkspaceCache, CommWorkspaceLease
 from .checkpoint import (
     get_model_state_dict,
     get_optimizer_state_dict,
@@ -87,6 +93,7 @@ from .planning.planner import (
     expert_owner_tail_plan,
     fsdp2_chunk_plan,
     hinted_ordered_group_plan,
+    load_balanced_matrix_owner_tail_group_plans,
     load_balanced_matrix_owner_tail_plan,
     ordered_matrix_owner_tail_plan,
 )
@@ -144,6 +151,7 @@ _MODULE_ALIASES = {
     "checkpoint": "checkpoint",
     "collectives": "runtime.collectives",
     "constraints": "planning.constraints",
+    "elastic_param_buffer": "runtime.elastic_param_buffer",
     "flat_buffer": "runtime.flat_buffer",
     "fsdp_unit": "runtime.fsdp_unit",
     "param_group": "runtime.param_group",
@@ -164,10 +172,12 @@ _MODULE_ALIASES = {
     "scheduler": "runtime.scheduler",
     "shard_hint": "planning.shard_hint",
     "state": "core.state",
+    "static_param_buffer": "runtime.static_param_buffer",
     "summary": "runtime.summary",
     "torch_dtensor": "core.torch_dtensor",
     "unit_collection": "runtime.unit_collection",
     "wrap": "policy.wrap",
+    "workspace_cache": "runtime.workspace_cache",
 }
 
 for _alias, _target in _MODULE_ALIASES.items():
@@ -175,6 +185,8 @@ for _alias, _target in _MODULE_ALIASES.items():
 
 __all__ = [
     "CommBufferId",
+    "CommWorkspaceCache",
+    "CommWorkspaceLease",
     "ClassifiedMatrixOptimizerParams",
     "DEFAULT_MUON_ADJUST_LR_FN",
     "DataParallelMeshDims",
@@ -182,6 +194,13 @@ __all__ = [
     "FSDPLifecycleState",
     "FSDPRuntimeState",
     "FullParamBufferPool",
+    "ElasticCommunicationPlan",
+    "ElasticParamBuffer",
+    "ElasticParamBufferLayout",
+    "ElasticParamBufferWorkspace",
+    "ElasticParamBufferWorkspaceLease",
+    "ElasticParamBufferWorkspacePlan",
+    "ElasticRankChunk",
     "GroupPlanner",
     "ParamShardHint",
     "ParamRuntimeKind",
@@ -216,6 +235,9 @@ __all__ = [
     "RuntimeParamGroupId",
     "RuntimeLayoutCompatibility",
     "ShardConstraint",
+    "StaticParamBuffer",
+    "StaticParamBufferLayout",
+    "StaticParamBufferWorkspacePlan",
     "WrapPolicy",
     "LocalOptimizerParamInfo",
     "LocalOptimizerStateTensor",
@@ -252,11 +274,14 @@ __all__ = [
     "is_matrix_shard_compatible_plan",
     "is_matrix_shard_placement",
     "load_balanced_matrix_owner_tail_plan",
+    "load_balanced_matrix_owner_tail_group_plans",
     "module_type_policy",
     "moe_expert_owner_rule",
     "make_matrix_dtensor",
     "make_matrix_placements",
     "make_muon_shard_aware_group_planner",
+    "make_cost_aware_muon_shard_aware_group_planner",
+    "make_scoped_muon_shard_aware_group_planner",
     "make_mixed_muon_adamw_optimizer",
     "install_matrix_optimizer_auto_prepare",
     "mesh_coordinate",
@@ -274,6 +299,7 @@ __all__ = [
     "planner_display_name",
     "planner_result_from_output",
     "prepare_matrix_optimizer",
+    "rank_segments_are_rank_contiguous_chunks",
     "load_matrix_dcp",
     "load_matrix_dcp_full_state",
     "load_matrix_state_dict",

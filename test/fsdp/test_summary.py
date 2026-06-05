@@ -52,10 +52,12 @@ class SummaryTest(unittest.TestCase):
         self.assertFalse(unit_summary["runtime_layout_requires_flat_reorder"])
         self.assertEqual(unit_summary["planner_rank_units"], unit.group_layout.shard_sizes)
         self.assertEqual(summary["communication_summary"]["gather_backend_counts"], {"single_rank_copy": 1})
+        self.assertEqual(summary["communication_summary"]["param_buffer_type_counts"], {"elastic": 1})
         self.assertEqual(summary["communication_summary"]["rank_chunk_fast_path_count"], 1)
         self.assertEqual(summary["communication_summary"]["workspace_preferred_kind_counts"], {"padded_rank_chunks": 1})
         self.assertEqual(summary["communication_summary"]["max_workspace_preferred_numel"], 10)
         self.assertEqual(unit_summary["communication_summary"]["effective_param_gather_backend"], "single_rank_copy")
+        self.assertEqual(unit_summary["communication_summary"]["param_buffer_type"], "elastic")
         self.assertTrue(unit_summary["communication_summary"]["rank_chunk_fast_path"])
         self.assertEqual(unit_summary["communication_summary"]["padding_waste_ratio"], 0.0)
         self.assertEqual(unit_summary["communication_summary"]["workspace_preferred_kind"], "padded_rank_chunks")
@@ -127,6 +129,7 @@ class SummaryTest(unittest.TestCase):
         self.assertIn("rank_mem=80", text)
         self.assertIn("rank_comm=0", text)
         self.assertIn("gather=single_rank_copy", text)
+        self.assertIn("param_buffer=elastic", text)
         self.assertIn("chunk_fast=True", text)
         self.assertIn("pad_waste=0.000", text)
         self.assertIn("state=sharded", text)
@@ -168,12 +171,31 @@ class SummaryTest(unittest.TestCase):
         self.assertTrue(any(stat["duration_count"] > 0 for stat in summary["event_stats"]))
         self.assertTrue(any(stat["category"] == "all_gather_enqueue" for stat in summary["communication_event_stats"]))
         self.assertTrue(any(stat["category"] == "all_gather_wait" for stat in summary["communication_event_stats"]))
+        self.assertTrue(any(event["name"] == "wait_all_gather_collective" for event in events))
+        self.assertTrue(any(event["name"] == "materialize_full_param_views" for event in events))
+        self.assertTrue(any(event["name"] == "pre_forward_runtime" for event in events))
         self.assertTrue(all("timestamp_ns" in event for event in events))
         self.assertTrue(all("runtime_param_group_id" in event for event in events))
         self.assertTrue(all("active_full_param_bytes" in event for event in events))
         self.assertTrue(all("unit_reduce_scatter_input_bytes" in event for event in events))
+        self.assertTrue(all("grad_bucket_workspace_kind" in event for event in events))
+        self.assertTrue(all("grad_bucket_workspace_numel" in event for event in events))
+        self.assertTrue(all("grad_bucket_workspace_padding_waste_numel" in event for event in events))
+        self.assertTrue(all("grad_bucket_workspace_persistent" in event for event in events))
+        self.assertTrue(all("param_materialization_kind" in event for event in events))
+        self.assertTrue(all("param_materialization_numel" in event for event in events))
+        self.assertTrue(all("param_materialization_bytes" in event for event in events))
+        self.assertTrue(all("param_materialization_reused" in event for event in events))
+        self.assertTrue(all("param_materialization_rank_chunk_fast_path" in event for event in events))
+        self.assertTrue(all("param_materialization_packed_full_order" in event for event in events))
         self.assertTrue(any(event["active_full_param_buffers"] > 0 for event in events))
         self.assertTrue(any(event["duration_ms"] is not None for event in events if event["name"].startswith("wait_unshard")))
+        self.assertTrue(
+            any(event["duration_ms"] is not None for event in events if event["name"] == "wait_all_gather_collective")
+        )
+        self.assertTrue(
+            any(event["duration_ms"] is not None for event in events if event["name"] == "materialize_full_param_views")
+        )
         self.assertLess(unit1_pre_backward["sequence"], unit0_pre_backward["sequence"])
 
     def test_runtime_events_include_event_level_memory_trace(self):
@@ -368,6 +390,7 @@ class SummaryTest(unittest.TestCase):
                     collective_numel=10,
                     collective_bytes=40,
                     collective_count=1,
+                    collective_phase_timings={"native_enqueue_ms": 0.2, "wait_ms": 0.3},
                 ),
                 RuntimeEvent(
                     name="wait_reduce_scatter_collective",
@@ -389,9 +412,14 @@ class SummaryTest(unittest.TestCase):
         text = format_runtime_events(summarize_runtime_events(model))
 
         self.assertIn("collective_event_stats:", text)
+        self.assertIn("collective_phase_timing_stats:", text)
         self.assertIn("all_gather_enqueue param_all_gather/native_sendrecv", text)
         self.assertIn("reduce_scatter_wait grad_reduce_scatter/native_reduce", text)
+        self.assertIn("param_all_gather/native_sendrecv native_enqueue_ms", text)
+        self.assertIn("param_all_gather/native_sendrecv wait_ms", text)
         self.assertIn("collective=param_all_gather backend=custom impl=native_sendrecv", text)
+        self.assertIn("native_enqueue_ms=0.200ms", text)
+        self.assertIn("wait_ms=0.300ms", text)
         self.assertIn("collective=grad_reduce_scatter backend=custom impl=native_reduce", text)
 
     def test_rejects_unwrapped_module(self):

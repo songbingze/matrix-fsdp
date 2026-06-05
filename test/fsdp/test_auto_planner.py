@@ -9,8 +9,11 @@ from matrix_fsdp import (
     MatrixFSDPOptimizer,
     auto_group_plan,
     build_shard_hints,
+    load_balanced_matrix_owner_tail_group_plans,
     load_balanced_matrix_owner_tail_plan,
+    make_cost_aware_muon_shard_aware_group_planner,
     make_muon_shard_aware_group_planner,
+    make_scoped_muon_shard_aware_group_planner,
     ordered_matrix_owner_tail_plan,
     matrix_fully_shard,
 )
@@ -194,6 +197,8 @@ class AutoPlannerTest(unittest.TestCase):
         self.assertTrue(any(value > 0 for value in selected.rank_adamw_param_bytes))
         self.assertGreater(selected.total_comm_bytes, 0)
         self.assertGreater(selected.max_rank_memory_bytes, 0)
+        self.assertGreater(selected.workspace_preferred_numel, 0)
+        self.assertGreaterEqual(selected.workspace_padding_waste_numel, 0)
         self.assertGreater(len(rows), 1)
 
     def test_format_auto_planner_report_includes_blocks_cost_terms_and_rank_params(self):
@@ -211,6 +216,8 @@ class AutoPlannerTest(unittest.TestCase):
         self.assertIn("rank_comm", text)
         self.assertIn("rank_muon", text)
         self.assertIn("rank_adamw", text)
+        self.assertIn("workspace", text)
+        self.assertIn("ws_pad", text)
         self.assertIn("max_rank_unit=512", text)
         self.assertIn("r0:q.weight", text)
 
@@ -494,6 +501,74 @@ class AutoPlannerTest(unittest.TestCase):
         self.assertEqual(layouts[1].owner_ranks("mlp.up0.weight"), (7,))
         self.assertEqual(layouts[1].owner_ranks("q.weight"), (5,))
         self.assertEqual(rank_totals, (1536, 1280, 1152, 1280, 1344, 1280, 1280, 1344))
+
+    def test_scoped_matrix_owner_tail_group_plans_balance_across_runtime_groups(self):
+        params = self._split_qkv_like_params()
+        layouts = load_balanced_matrix_owner_tail_group_plans((params, params, params, params), world_size=8)
+        rank_totals = tuple(sum(layout.shard_sizes[rank] for layout in layouts) for rank in range(8))
+
+        self.assertEqual(rank_totals, (1344, 1344, 1344, 1344, 1280, 1280, 1280, 1280))
+        self.assertEqual(layouts[0].owner_ranks("mlp.up0.weight"), (0,))
+        self.assertEqual(layouts[1].owner_ranks("mlp.up0.weight"), (3,))
+        self.assertEqual(layouts[2].owner_ranks("mlp.up0.weight"), (6,))
+        self.assertEqual(layouts[3].owner_ranks("mlp.up0.weight"), (1,))
+
+    def test_scoped_muon_shard_aware_group_planner_returns_preplanned_groups(self):
+        params = self._split_qkv_like_params()
+        planner = make_scoped_muon_shard_aware_group_planner((params, params, params, params))
+
+        evaluations = [planner(params, 8) for _ in range(4)]
+        layouts = [evaluation.layout for evaluation in evaluations]
+        rank_totals = tuple(sum(layout.shard_sizes[rank] for layout in layouts) for rank in range(8))
+
+        self.assertTrue(all(evaluation.name == "matrix_owner_tail_scope_greedy" for evaluation in evaluations))
+        self.assertEqual(rank_totals, (1344, 1344, 1344, 1344, 1280, 1280, 1280, 1280))
+        with self.assertRaisesRegex(RuntimeError, "more times than the number of planned groups"):
+            planner(params, 8)
+
+    def test_cost_aware_muon_planner_uses_scope_when_workspace_growth_is_bounded(self):
+        params = self._split_qkv_like_params()
+        planner = make_cost_aware_muon_shard_aware_group_planner(
+            (params, params, params, params),
+            max_workspace_ratio=2.0,
+            max_workspace_padding_ratio=4.0,
+        )
+
+        evaluations = [planner(params, 8) for _ in range(4)]
+
+        self.assertTrue(all(evaluation.name == "matrix_owner_tail_scope_greedy" for evaluation in evaluations))
+        self.assertTrue(
+            all("cost_aware_owner_assignment=scope_greedy" in evaluation.warnings for evaluation in evaluations)
+        )
+
+    def test_cost_aware_muon_planner_rejects_scope_when_workspace_growth_is_too_high(self):
+        params = self._split_qkv_like_params()
+        planner = make_cost_aware_muon_shard_aware_group_planner(
+            (params, params, params, params),
+            max_workspace_ratio=1.01,
+            max_workspace_padding_ratio=1.0,
+        )
+
+        evaluations = [planner(params, 8) for _ in range(4)]
+
+        self.assertTrue(all(evaluation.name == "matrix_owner_tail_role_greedy" for evaluation in evaluations))
+        self.assertTrue(
+            all("cost_aware_owner_assignment=role_greedy" in evaluation.warnings for evaluation in evaluations)
+        )
+
+    def test_planner_resource_estimates_workspace_padding(self):
+        params = self._split_qkv_like_params()
+        evaluation = make_muon_shard_aware_group_planner(owner_assignment="role_greedy")(params, 8)
+        resources = evaluation.resource_estimate
+
+        self.assertIsNotNone(resources)
+        assert resources is not None
+        self.assertEqual(resources.workspace_preferred_numel, max(evaluation.layout.shard_sizes) * 8)
+        self.assertEqual(
+            resources.workspace_padding_waste_numel,
+            resources.workspace_preferred_numel - evaluation.layout.total_numel,
+        )
+        self.assertGreater(resources.workspace_padding_waste_ratio, 0.0)
 
     def test_muon_shard_aware_group_planner_rejects_unknown_rotation_strategy(self):
         with self.assertRaisesRegex(ValueError, "Unknown rotation_strategy"):

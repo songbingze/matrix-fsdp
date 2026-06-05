@@ -5,6 +5,7 @@ from .custom_collectives import (
     native_segment_p2p_enabled,
     normalize_matrix_collective_backend,
     resolve_custom_allgatherv_impl,
+    torch_batch_sendrecv_chunk_fast_path_enabled,
 )
 from .native import (
     NativeKernelStatus,
@@ -37,4 +38,5 @@ __all__ = [
     "native_sendrecv_rank_segments",
     "normalize_matrix_collective_backend",
     "resolve_custom_allgatherv_impl",
+    "torch_batch_sendrecv_chunk_fast_path_enabled",
 ]

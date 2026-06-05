@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import count
 import os
 
@@ -19,6 +19,7 @@ from matrix_fsdp.kernels import (
 )
 
 _VALIDATE_OWNER_COLLECTIVE_SIGNATURE_ENV = "MATRIX_FSDP_VALIDATE_OWNER_COLLECTIVE_SIGNATURE"
+_UNEVEN_REDUCE_SCATTER_ZERO_SIZE_ENV = "MATRIX_FSDP_UNEVEN_REDUCE_SCATTER_ZERO_SIZE"
 _OWNER_COLLECTIVE_SEQUENCE = count()
 
 
@@ -32,6 +33,14 @@ class MatrixCollectiveHandle:
     collective_numel: int = 0
     collective_bytes: int = 0
     collective_count: int = 0
+    collective_sync_mode: str | None = None
+    param_materialization_kind: str | None = None
+    param_materialization_numel: int = 0
+    param_materialization_bytes: int = 0
+    param_materialization_reused: bool = False
+    param_materialization_rank_chunk_fast_path: bool = False
+    param_materialization_packed_full_order: bool = False
+    collective_phase_timings: dict[str, float] = field(default_factory=dict)
 
     def wait(self) -> torch.Tensor:
         if self._result is None:
@@ -50,6 +59,8 @@ class MatrixTensorCollectiveHandle:
     collective_numel: int = 0
     collective_bytes: int = 0
     collective_count: int = 0
+    collective_sync_mode: str | None = None
+    collective_phase_timings: dict[str, float] = field(default_factory=dict)
 
     def wait(self) -> torch.Tensor:
         if not self._waited:
@@ -74,6 +85,14 @@ def set_collective_metadata(
     handle.collective_numel = int(numel)
     handle.collective_bytes = int(numel) * int(element_size)
     handle.collective_count = int(count)
+    return handle
+
+
+def set_collective_sync_mode(
+    handle: MatrixCollectiveHandle | MatrixTensorCollectiveHandle,
+    sync_mode: str,
+) -> MatrixCollectiveHandle | MatrixTensorCollectiveHandle:
+    handle.collective_sync_mode = sync_mode
     return handle
 
 
@@ -120,8 +139,19 @@ def validate_owner_collective_signature(
 
 
 def owner_collective_signature_validation_enabled() -> bool:
-    value = os.environ.get(_VALIDATE_OWNER_COLLECTIVE_SIGNATURE_ENV, "1").lower()
-    return value not in {"0", "false", "no", "off"}
+    value = os.environ.get(_VALIDATE_OWNER_COLLECTIVE_SIGNATURE_ENV, "").lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def zero_size_uneven_reduce_scatter_enabled() -> bool:
+    value = os.environ.get(_UNEVEN_REDUCE_SCATTER_ZERO_SIZE_ENV, "1").lower()
+    if value in {"1", "true", "yes", "on", "allow", "enabled"}:
+        return True
+    if value in {"0", "false", "no", "off", "fallback", "owner_reduce", "disabled"}:
+        return False
+    raise ValueError(
+        f"{_UNEVEN_REDUCE_SCATTER_ZERO_SIZE_ENV} must be enabled/disabled or owner_reduce/fallback."
+    )
 
 
 def _rank_segments_signature(
@@ -258,6 +288,9 @@ def all_gatherv_rank_segments_1d_into_async(
     cuda_stream: torch.cuda.Stream | None = None,
     collective_key: str | None = None,
     validate_owner_collective_signature: bool = True,
+    coalesced_rank_segments: tuple[tuple[LayoutSegment, ...], ...] | None = None,
+    rank_chunk_shard_sizes: tuple[int, ...] | None = None,
+    rank_chunk_segments: tuple[tuple[LayoutSegment, ...], ...] | None = None,
 ) -> MatrixCollectiveHandle:
     backend = normalize_matrix_collective_backend(backend)
     if backend == "custom":
@@ -270,6 +303,9 @@ def all_gatherv_rank_segments_1d_into_async(
             cuda_stream=cuda_stream,
             collective_key=collective_key,
             validate_signature=validate_owner_collective_signature,
+            coalesced_rank_segments=coalesced_rank_segments,
+            rank_chunk_shard_sizes=rank_chunk_shard_sizes,
+            rank_chunk_segments=rank_chunk_segments,
         )
     if backend != "owner_broadcast":
         raise ValueError("all_gatherv_rank_segments_1d_into_async() supports 'owner_broadcast' or 'custom'.")
@@ -589,7 +625,7 @@ def reduce_scatter_uneven_rank_chunks_1d_async(
         len(shard_sizes) == 1
         or not dist_is_ready()
         or not compact
-        or any(size == 0 for size in shard_sizes)
+        or (any(size == 0 for size in shard_sizes) and not zero_size_uneven_reduce_scatter_enabled())
         or not _supports_uneven_reduce_scatter(packed_rank_chunks, group)
     ):
         return reduce_owner_rank_chunks_1d_async(
@@ -619,7 +655,7 @@ def reduce_scatter_uneven_rank_chunks_1d_async(
             torch.cuda.current_stream(packed_rank_chunks.device).wait_event(event)
             return local_grad_shard
 
-        return MatrixTensorCollectiveHandle(local_grad_shard, wait)
+        return MatrixTensorCollectiveHandle(local_grad_shard, wait, collective_sync_mode="cuda_event")
 
     work = dist.reduce_scatter(local_grad_shard, input_list, op=dist.ReduceOp.SUM, group=group, async_op=True)
 
@@ -629,7 +665,7 @@ def reduce_scatter_uneven_rank_chunks_1d_async(
             local_grad_shard.div_(len(shard_sizes))
         return local_grad_shard
 
-    return MatrixTensorCollectiveHandle(local_grad_shard, wait)
+    return MatrixTensorCollectiveHandle(local_grad_shard, wait, collective_sync_mode="work_wait")
 
 
 def reduce_owner_rank_chunks_1d_async(
@@ -658,7 +694,12 @@ def reduce_owner_rank_chunks_1d_async(
         if len(shard_sizes) != 1:
             raise RuntimeError("Owner reduce without a process group only supports one local shard.")
         local_grad_shard.copy_(packed_rank_chunks[: shard_sizes[rank]])
-        return MatrixTensorCollectiveHandle(local_grad_shard, lambda: local_grad_shard, _waited=True)
+        return MatrixTensorCollectiveHandle(
+            local_grad_shard,
+            lambda: local_grad_shard,
+            _waited=True,
+            collective_sync_mode="already_waited",
+        )
 
     def rank_chunk(owner_rank: int) -> torch.Tensor:
         start = sum(shard_sizes[:owner_rank]) if compact else owner_rank * max_shard_size
@@ -682,7 +723,7 @@ def reduce_owner_rank_chunks_1d_async(
             torch.cuda.current_stream(packed_rank_chunks.device).wait_event(event)
             return local_grad_shard
 
-        return MatrixTensorCollectiveHandle(local_grad_shard, wait)
+        return MatrixTensorCollectiveHandle(local_grad_shard, wait, collective_sync_mode="cuda_event")
 
     works = []
     for owner_rank, size in enumerate(shard_sizes):
@@ -698,7 +739,7 @@ def reduce_owner_rank_chunks_1d_async(
         local_grad_shard.copy_(rank_chunk(rank))
         return local_grad_shard
 
-    return MatrixTensorCollectiveHandle(local_grad_shard, wait)
+    return MatrixTensorCollectiveHandle(local_grad_shard, wait, collective_sync_mode="work_wait")
 
 
 def dist_reduce_group_rank(
@@ -889,7 +930,12 @@ def reduce_scatter_padded_rank_chunks_1d_async(
         raise ValueError(f"local_size must be non-negative, got {local_size}.")
     if not dist_is_ready():
         local_tensor = packed_rank_chunks[:local_size].contiguous()
-        return MatrixTensorCollectiveHandle(local_tensor, lambda: local_tensor, _waited=True)
+        return MatrixTensorCollectiveHandle(
+            local_tensor,
+            lambda: local_tensor,
+            _waited=True,
+            collective_sync_mode="already_waited",
+        )
     if cuda_stream is not None and not packed_rank_chunks.is_cuda:
         raise ValueError("cuda_stream can only be used with CUDA tensors.")
 
@@ -922,7 +968,7 @@ def reduce_scatter_padded_rank_chunks_1d_async(
             torch.cuda.current_stream(packed_rank_chunks.device).wait_event(event)
             return local_tensor
 
-        return MatrixTensorCollectiveHandle(local_tensor, wait)
+        return MatrixTensorCollectiveHandle(local_tensor, wait, collective_sync_mode="cuda_event")
 
     work = dist.reduce_scatter_tensor(output, packed_rank_chunks, group=group, async_op=True)
 
@@ -932,7 +978,7 @@ def reduce_scatter_padded_rank_chunks_1d_async(
             output.div_(world_size)
         return local_tensor
 
-    return MatrixTensorCollectiveHandle(local_tensor, wait)
+    return MatrixTensorCollectiveHandle(local_tensor, wait, collective_sync_mode="work_wait")
 
 
 def reduce_scatter_matrix_1d(

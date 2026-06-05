@@ -13,7 +13,9 @@ from matrix_fsdp.collectives import (
 from matrix_fsdp.runtime.collectives import (
     _make_uneven_all_gather_output_list,
     _make_uneven_reduce_scatter_input_list,
+    owner_collective_signature_validation_enabled,
     validate_owner_collective_signature,
+    zero_size_uneven_reduce_scatter_enabled,
 )
 from matrix_fsdp.layout import LayoutSegment
 
@@ -116,6 +118,7 @@ def _run_two_rank_reduce_scatterv_backend(rank: int, world_size: int, init_file:
 
 
 def _run_two_rank_owner_signature_mismatch(rank: int, world_size: int, init_file: str) -> None:
+    os.environ["MATRIX_FSDP_VALIDATE_OWNER_COLLECTIVE_SIGNATURE"] = "1"
     dist.init_process_group(
         "gloo",
         init_method=f"file://{init_file}",
@@ -145,11 +148,18 @@ def _run_two_rank_owner_signature_mismatch(rank: int, world_size: int, init_file
         else:
             raise AssertionError("Expected owner collective signature mismatch.")
     finally:
+        os.environ.pop("MATRIX_FSDP_VALIDATE_OWNER_COLLECTIVE_SIGNATURE", None)
         dist.destroy_process_group()
 
 
 @unittest.skipUnless(dist.is_available(), "torch.distributed is not available")
 class MatrixCollectiveBackendTest(unittest.TestCase):
+    def test_owner_collective_signature_validation_is_debug_opt_in(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(owner_collective_signature_validation_enabled())
+        with unittest.mock.patch.dict(os.environ, {"MATRIX_FSDP_VALIDATE_OWNER_COLLECTIVE_SIGNATURE": "1"}):
+            self.assertTrue(owner_collective_signature_validation_enabled())
+
     def test_uneven_all_gather_uses_full_buffer_views_for_contiguous_rank_segments(self):
         local = torch.empty(3, dtype=torch.float32)
         output = torch.empty(5, dtype=torch.float32)
@@ -191,6 +201,22 @@ class MatrixCollectiveBackendTest(unittest.TestCase):
         self.assertEqual(input_list[1].data_ptr(), packed[3:].data_ptr())
         torch.testing.assert_close(input_list[0], torch.tensor([0.0, 1.0, 2.0]))
         torch.testing.assert_close(input_list[1], torch.tensor([3.0, 4.0]))
+
+    def test_uneven_reduce_scatter_keeps_zero_size_rank_chunks(self):
+        packed = torch.arange(3, dtype=torch.float32)
+        input_list = _make_uneven_reduce_scatter_input_list(packed, (3, 0))
+
+        self.assertEqual(input_list[0].data_ptr(), packed.data_ptr())
+        self.assertEqual(input_list[1].numel(), 0)
+        torch.testing.assert_close(input_list[0], torch.tensor([0.0, 1.0, 2.0]))
+
+    def test_zero_size_uneven_reduce_scatter_env_toggle(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(zero_size_uneven_reduce_scatter_enabled())
+        with unittest.mock.patch.dict(os.environ, {"MATRIX_FSDP_UNEVEN_REDUCE_SCATTER_ZERO_SIZE": "owner_reduce"}):
+            self.assertFalse(zero_size_uneven_reduce_scatter_enabled())
+        with unittest.mock.patch.dict(os.environ, {"MATRIX_FSDP_UNEVEN_REDUCE_SCATTER_ZERO_SIZE": "allow"}):
+            self.assertTrue(zero_size_uneven_reduce_scatter_enabled())
 
     def test_two_rank_cpu_owner_broadcast_allgatherv_semantics(self):
         self._run_two_rank_allgatherv_backend("owner_broadcast")

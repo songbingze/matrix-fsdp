@@ -5,15 +5,20 @@
 
 #include <cuda_runtime.h>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 namespace py = pybind11;
 
 namespace {
 
-ncclComm_t g_comm = nullptr;
-int g_rank = -1;
-int g_world_size = -1;
+struct CommState {
+  ncclComm_t comm = nullptr;
+  int rank = -1;
+  int world_size = -1;
+};
+
+std::unordered_map<int, CommState> g_comm_lanes;
 
 #define MATRIX_NCCL_CHECK(cmd)                                  \
   do {                                                          \
@@ -45,7 +50,31 @@ ncclDataType_t nccl_dtype_for(torch::ScalarType dtype) {
   }
 }
 
+CommState& require_comm(int lane_id) {
+  auto it = g_comm_lanes.find(lane_id);
+  TORCH_CHECK(
+      it != g_comm_lanes.end() && it->second.comm != nullptr,
+      "MatrixFSDP native NCCL communicator is not initialized for lane ",
+      lane_id);
+  return it->second;
+}
+
+void destroy_comm_lane(int lane_id) {
+  auto it = g_comm_lanes.find(lane_id);
+  if (it == g_comm_lanes.end()) {
+    return;
+  }
+  if (it->second.comm != nullptr) {
+    MATRIX_NCCL_CHECK(ncclCommDestroy(it->second.comm));
+  }
+  g_comm_lanes.erase(it);
+}
+
 }  // namespace
+
+bool nccl_comm_lanes_supported() {
+  return true;
+}
 
 py::bytes get_nccl_unique_id() {
   ncclUniqueId unique_id;
@@ -53,27 +82,30 @@ py::bytes get_nccl_unique_id() {
   return py::bytes(unique_id.internal, NCCL_UNIQUE_ID_BYTES);
 }
 
-void init_nccl_comm(py::bytes unique_id_bytes, int rank, int world_size) {
+void init_nccl_comm(py::bytes unique_id_bytes, int rank, int world_size, int lane_id) {
   std::string unique_id_string = unique_id_bytes;
   TORCH_CHECK(unique_id_string.size() == NCCL_UNIQUE_ID_BYTES, "Invalid NCCL unique id size");
-  if (g_comm != nullptr) {
-    MATRIX_NCCL_CHECK(ncclCommDestroy(g_comm));
-    g_comm = nullptr;
-  }
+  destroy_comm_lane(lane_id);
   ncclUniqueId unique_id;
   std::memcpy(unique_id.internal, unique_id_string.data(), NCCL_UNIQUE_ID_BYTES);
-  MATRIX_NCCL_CHECK(ncclCommInitRank(&g_comm, world_size, unique_id, rank));
-  g_rank = rank;
-  g_world_size = world_size;
+  CommState state;
+  MATRIX_NCCL_CHECK(ncclCommInitRank(&state.comm, world_size, unique_id, rank));
+  state.rank = rank;
+  state.world_size = world_size;
+  g_comm_lanes[lane_id] = state;
 }
 
-void destroy_nccl_comm() {
-  if (g_comm != nullptr) {
-    MATRIX_NCCL_CHECK(ncclCommDestroy(g_comm));
-    g_comm = nullptr;
-    g_rank = -1;
-    g_world_size = -1;
+void destroy_nccl_comm(int lane_id) {
+  if (lane_id >= 0) {
+    destroy_comm_lane(lane_id);
+    return;
   }
+  for (auto& item : g_comm_lanes) {
+    if (item.second.comm != nullptr) {
+      MATRIX_NCCL_CHECK(ncclCommDestroy(item.second.comm));
+    }
+  }
+  g_comm_lanes.clear();
 }
 
 void group_broadcast_rank_segments(
@@ -83,8 +115,9 @@ void group_broadcast_rank_segments(
     torch::Tensor global_starts,
     torch::Tensor local_starts,
     torch::Tensor numels,
-    int rank) {
-  TORCH_CHECK(g_comm != nullptr, "MatrixFSDP native NCCL communicator is not initialized");
+    int rank,
+    int lane_id) {
+  CommState& comm_state = require_comm(lane_id);
   MATRIX_CHECK_CUDA(local_tensor);
   MATRIX_CHECK_CUDA(output_tensor);
   MATRIX_CHECK_CPU(src_ranks);
@@ -112,6 +145,7 @@ void group_broadcast_rank_segments(
   if (range_count == 0) {
     return;
   }
+  TORCH_CHECK(rank == comm_state.rank, "rank must match initialized native NCCL rank");
 
   auto dtype = nccl_dtype_for(local_tensor.scalar_type());
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -134,7 +168,7 @@ void group_broadcast_rank_segments(
     void* recv_buffer = output_base + global_start * element_size;
     void* send_buffer =
         rank == src_rank ? local_base + local_start_ptr[i] * element_size : recv_buffer;
-    MATRIX_NCCL_CHECK(ncclBroadcast(send_buffer, recv_buffer, count, dtype, src_rank, g_comm, stream));
+    MATRIX_NCCL_CHECK(ncclBroadcast(send_buffer, recv_buffer, count, dtype, src_rank, comm_state.comm, stream));
   }
   MATRIX_NCCL_CHECK(ncclGroupEnd());
 }
@@ -146,8 +180,9 @@ void sendrecv_rank_segments(
     torch::Tensor global_starts,
     torch::Tensor local_starts,
     torch::Tensor numels,
-    int rank) {
-  TORCH_CHECK(g_comm != nullptr, "MatrixFSDP native NCCL communicator is not initialized");
+    int rank,
+    int lane_id) {
+  CommState& comm_state = require_comm(lane_id);
   MATRIX_CHECK_CUDA(local_tensor);
   MATRIX_CHECK_CUDA(output_tensor);
   MATRIX_CHECK_CPU(src_ranks);
@@ -175,6 +210,7 @@ void sendrecv_rank_segments(
   if (range_count == 0) {
     return;
   }
+  TORCH_CHECK(rank == comm_state.rank, "rank must match initialized native NCCL rank");
 
   auto dtype = nccl_dtype_for(local_tensor.scalar_type());
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -213,14 +249,14 @@ void sendrecv_rank_segments(
     void* recv_buffer = output_base + global_start * element_size;
     void* send_buffer = local_base + local_start * element_size;
     if (rank == src_rank) {
-      for (int peer = 0; peer < g_world_size; ++peer) {
+      for (int peer = 0; peer < comm_state.world_size; ++peer) {
         if (peer == rank) {
           continue;
         }
-        MATRIX_NCCL_CHECK(ncclSend(send_buffer, count, dtype, peer, g_comm, stream));
+        MATRIX_NCCL_CHECK(ncclSend(send_buffer, count, dtype, peer, comm_state.comm, stream));
       }
     } else {
-      MATRIX_NCCL_CHECK(ncclRecv(recv_buffer, count, dtype, src_rank, g_comm, stream));
+      MATRIX_NCCL_CHECK(ncclRecv(recv_buffer, count, dtype, src_rank, comm_state.comm, stream));
     }
   }
   MATRIX_NCCL_CHECK(ncclGroupEnd());
@@ -230,8 +266,9 @@ void sendrecv_rank_chunks(
     torch::Tensor local_tensor,
     torch::Tensor output_tensor,
     torch::Tensor shard_sizes,
-    int rank) {
-  TORCH_CHECK(g_comm != nullptr, "MatrixFSDP native NCCL communicator is not initialized");
+    int rank,
+    int lane_id) {
+  CommState& comm_state = require_comm(lane_id);
   MATRIX_CHECK_CUDA(local_tensor);
   MATRIX_CHECK_CUDA(output_tensor);
   MATRIX_CHECK_CPU(shard_sizes);
@@ -242,18 +279,18 @@ void sendrecv_rank_chunks(
   TORCH_CHECK(local_tensor.dim() == 1, "local_tensor must be 1D");
   TORCH_CHECK(output_tensor.dim() == 1, "output_tensor must be 1D");
   TORCH_CHECK(local_tensor.scalar_type() == output_tensor.scalar_type(), "source and destination dtype mismatch");
-  TORCH_CHECK(shard_sizes.numel() == g_world_size, "shard_sizes length must match NCCL world size");
-  TORCH_CHECK(rank == g_rank, "rank must match initialized native NCCL rank");
-  TORCH_CHECK(rank >= 0 && rank < g_world_size, "rank out of range");
+  TORCH_CHECK(shard_sizes.numel() == comm_state.world_size, "shard_sizes length must match NCCL world size");
+  TORCH_CHECK(rank == comm_state.rank, "rank must match initialized native NCCL rank");
+  TORCH_CHECK(rank >= 0 && rank < comm_state.world_size, "rank out of range");
 
   const int64_t* shard_size_ptr = shard_sizes.data_ptr<int64_t>();
-  std::vector<int64_t> shard_offsets(g_world_size + 1, 0);
-  for (int peer = 0; peer < g_world_size; ++peer) {
+  std::vector<int64_t> shard_offsets(comm_state.world_size + 1, 0);
+  for (int peer = 0; peer < comm_state.world_size; ++peer) {
     const int64_t shard_size = shard_size_ptr[peer];
     TORCH_CHECK(shard_size >= 0, "shard_sizes must be non-negative");
     shard_offsets[peer + 1] = shard_offsets[peer] + shard_size;
   }
-  const int64_t total_numel = shard_offsets[g_world_size];
+  const int64_t total_numel = shard_offsets[comm_state.world_size];
   TORCH_CHECK(output_tensor.numel() == total_numel, "output_tensor numel must equal sum(shard_sizes)");
   TORCH_CHECK(local_tensor.numel() == shard_size_ptr[rank], "local_tensor numel must match this rank's shard size");
   if (total_numel == 0) {
@@ -277,21 +314,21 @@ void sendrecv_rank_chunks(
   }
 
   MATRIX_NCCL_CHECK(ncclGroupStart());
-  for (int src_rank = 0; src_rank < g_world_size; ++src_rank) {
+  for (int src_rank = 0; src_rank < comm_state.world_size; ++src_rank) {
     const int64_t count = shard_size_ptr[src_rank];
     if (count == 0) {
       continue;
     }
     void* recv_buffer = output_base + shard_offsets[src_rank] * element_size;
     if (rank == src_rank) {
-      for (int peer = 0; peer < g_world_size; ++peer) {
+      for (int peer = 0; peer < comm_state.world_size; ++peer) {
         if (peer == rank) {
           continue;
         }
-        MATRIX_NCCL_CHECK(ncclSend(local_base, count, dtype, peer, g_comm, stream));
+        MATRIX_NCCL_CHECK(ncclSend(local_base, count, dtype, peer, comm_state.comm, stream));
       }
     } else {
-      MATRIX_NCCL_CHECK(ncclRecv(recv_buffer, count, dtype, src_rank, g_comm, stream));
+      MATRIX_NCCL_CHECK(ncclRecv(recv_buffer, count, dtype, src_rank, comm_state.comm, stream));
     }
   }
   MATRIX_NCCL_CHECK(ncclGroupEnd());
@@ -302,8 +339,9 @@ void reduce_rank_chunks(
     torch::Tensor local_output,
     torch::Tensor shard_sizes,
     int rank,
-    bool compact) {
-  TORCH_CHECK(g_comm != nullptr, "MatrixFSDP native NCCL communicator is not initialized");
+    bool compact,
+    int lane_id) {
+  CommState& comm_state = require_comm(lane_id);
   MATRIX_CHECK_CUDA(packed_rank_chunks);
   MATRIX_CHECK_CUDA(local_output);
   MATRIX_CHECK_CPU(shard_sizes);
@@ -314,20 +352,21 @@ void reduce_rank_chunks(
   TORCH_CHECK(packed_rank_chunks.dim() == 1, "packed_rank_chunks must be 1D");
   TORCH_CHECK(local_output.dim() == 1, "local_output must be 1D");
   TORCH_CHECK(packed_rank_chunks.scalar_type() == local_output.scalar_type(), "source and destination dtype mismatch");
-  TORCH_CHECK(shard_sizes.numel() == g_world_size, "shard_sizes length must match NCCL world size");
-  TORCH_CHECK(rank == g_rank, "rank must match initialized native NCCL rank");
-  TORCH_CHECK(rank >= 0 && rank < g_world_size, "rank out of range");
+  TORCH_CHECK(shard_sizes.numel() == comm_state.world_size, "shard_sizes length must match NCCL world size");
+  TORCH_CHECK(rank == comm_state.rank, "rank must match initialized native NCCL rank");
+  TORCH_CHECK(rank >= 0 && rank < comm_state.world_size, "rank out of range");
 
   const int64_t* shard_size_ptr = shard_sizes.data_ptr<int64_t>();
-  std::vector<int64_t> shard_offsets(g_world_size + 1, 0);
+  std::vector<int64_t> shard_offsets(comm_state.world_size + 1, 0);
   int64_t max_shard_size = 0;
-  for (int peer = 0; peer < g_world_size; ++peer) {
+  for (int peer = 0; peer < comm_state.world_size; ++peer) {
     const int64_t shard_size = shard_size_ptr[peer];
     TORCH_CHECK(shard_size >= 0, "shard_sizes must be non-negative");
     shard_offsets[peer + 1] = shard_offsets[peer] + shard_size;
     max_shard_size = std::max(max_shard_size, shard_size);
   }
-  const int64_t expected_numel = compact ? shard_offsets[g_world_size] : g_world_size * max_shard_size;
+  const int64_t expected_numel =
+      compact ? shard_offsets[comm_state.world_size] : comm_state.world_size * max_shard_size;
   TORCH_CHECK(packed_rank_chunks.numel() == expected_numel, "packed_rank_chunks numel does not match shard layout");
   TORCH_CHECK(local_output.numel() == shard_size_ptr[rank], "local_output numel must match this rank's shard size");
   if (expected_numel == 0) {
@@ -341,7 +380,7 @@ void reduce_rank_chunks(
   char* output_base = static_cast<char*>(local_output.data_ptr());
 
   MATRIX_NCCL_CHECK(ncclGroupStart());
-  for (int owner_rank = 0; owner_rank < g_world_size; ++owner_rank) {
+  for (int owner_rank = 0; owner_rank < comm_state.world_size; ++owner_rank) {
     const int64_t count = shard_size_ptr[owner_rank];
     if (count == 0) {
       continue;
@@ -349,7 +388,8 @@ void reduce_rank_chunks(
     const int64_t chunk_offset = compact ? shard_offsets[owner_rank] : owner_rank * max_shard_size;
     void* send_buffer = packed_base + chunk_offset * element_size;
     void* recv_buffer = rank == owner_rank ? output_base : send_buffer;
-    MATRIX_NCCL_CHECK(ncclReduce(send_buffer, recv_buffer, count, dtype, ncclSum, owner_rank, g_comm, stream));
+    MATRIX_NCCL_CHECK(
+        ncclReduce(send_buffer, recv_buffer, count, dtype, ncclSum, owner_rank, comm_state.comm, stream));
   }
   MATRIX_NCCL_CHECK(ncclGroupEnd());
 }

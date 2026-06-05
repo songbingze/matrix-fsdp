@@ -75,6 +75,18 @@ def summarize_runtime_events(
                     "collective_numel": event.collective_numel,
                     "collective_bytes": event.collective_bytes,
                     "collective_count": event.collective_count,
+                    "collective_sync_mode": event.collective_sync_mode,
+                    "collective_phase_timings": dict(event.collective_phase_timings),
+                    "grad_bucket_workspace_kind": event.grad_bucket_workspace_kind,
+                    "grad_bucket_workspace_numel": event.grad_bucket_workspace_numel,
+                    "grad_bucket_workspace_padding_waste_numel": event.grad_bucket_workspace_padding_waste_numel,
+                    "grad_bucket_workspace_persistent": event.grad_bucket_workspace_persistent,
+                    "param_materialization_kind": event.param_materialization_kind,
+                    "param_materialization_numel": event.param_materialization_numel,
+                    "param_materialization_bytes": event.param_materialization_bytes,
+                    "param_materialization_reused": event.param_materialization_reused,
+                    "param_materialization_rank_chunk_fast_path": event.param_materialization_rank_chunk_fast_path,
+                    "param_materialization_packed_full_order": event.param_materialization_packed_full_order,
                 }
             )
     events.sort(key=lambda event_summary: event_summary["sequence"])
@@ -89,6 +101,7 @@ def summarize_runtime_events(
         "event_stats": _summarize_event_stats(events),
         "communication_event_stats": _summarize_communication_event_stats(events),
         "collective_event_stats": _summarize_collective_event_stats(events),
+        "collective_phase_timing_stats": _summarize_collective_phase_timing_stats(events),
         "schedulers": schedulers,
         "communication_summary": _aggregate_communication_summaries(param_group_summaries),
     }
@@ -119,6 +132,7 @@ def format_param_group_summary(summary: dict[str, Any]) -> str:
             f"local={param_group_summary['local_numel']} "
             f"rank_mem={_format_rank_values(param_group_summary['rank_memory_bytes'])} "
             f"rank_comm={_format_rank_values(param_group_summary['rank_comm_bytes'])} "
+            f"param_buffer={param_group_summary['communication_summary']['param_buffer_type']} "
             f"gather={param_group_summary['communication_summary']['effective_param_gather_backend']} "
             f"custom={param_group_summary['communication_summary']['resolved_custom_allgatherv_impl']} "
             f"reduce={param_group_summary['communication_summary']['effective_grad_reduce_backend']} "
@@ -130,6 +144,7 @@ def format_param_group_summary(summary: dict[str, Any]) -> str:
             f"ws_numel={param_group_summary['communication_summary']['workspace_preferred_numel']} "
             f"ws_alloc={param_group_summary['communication_summary']['workspace_allocate_count']} "
             f"ws_reuse={param_group_summary['communication_summary']['workspace_reuse_count']} "
+            f"ws_cache={param_group_summary['communication_summary']['workspace_max_cached_per_key']} "
             f"state={param_group_summary['lifecycle_state']} "
             f"reshard_after_forward={param_group_summary['reshard_after_forward']} "
             f"forward_prefetch={param_group_summary['forward_prefetch']} "
@@ -155,6 +170,10 @@ def format_runtime_events(summary: dict[str, Any]) -> str:
             f"forward_blocked={scheduler_summary['forward_prefetch_budget_blocked']} "
             f"backward_blocked={scheduler_summary['backward_prefetch_budget_blocked']} "
             f"backward_deferred={scheduler_summary['backward_prefetch_memory_deferred']} "
+            f"backward_prefetch_pending_reduce_waits={scheduler_summary['backward_prefetch_pending_reduce_waits']} "
+            f"owner_prefetch_waits_before_reduce={scheduler_summary['owner_prefetch_waits_before_reduce']} "
+            f"post_optim_events={scheduler_summary['post_optimizer_events_recorded']} "
+            f"post_optim_waits={scheduler_summary['post_optimizer_event_waits']} "
             f"max_full_buffers={scheduler_summary['max_active_full_param_buffers']} "
             f"max_full_numel={scheduler_summary['max_active_full_param_numel']} "
             f"max_full_bytes={scheduler_summary['max_active_full_param_bytes']} "
@@ -173,6 +192,9 @@ def format_runtime_events(summary: dict[str, Any]) -> str:
     timed_event_stats = [stat for stat in summary.get("event_stats", ()) if stat["duration_count"] > 0]
     communication_event_stats = [stat for stat in summary.get("communication_event_stats", ()) if stat["duration_count"] > 0]
     collective_event_stats = [stat for stat in summary.get("collective_event_stats", ()) if stat["duration_count"] > 0]
+    collective_phase_timing_stats = [
+        stat for stat in summary.get("collective_phase_timing_stats", ()) if stat["duration_count"] > 0
+    ]
     if communication_event_stats:
         lines.append("  communication_event_stats:")
         for stat in communication_event_stats:
@@ -200,6 +222,19 @@ def format_runtime_events(summary: dict[str, Any]) -> str:
                 f"bytes={stat['collective_bytes']} "
                 f"ops={stat['collective_count']}"
             )
+    if collective_phase_timing_stats:
+        lines.append("  collective_phase_timing_stats:")
+        for stat in collective_phase_timing_stats:
+            lines.append(
+                "    "
+                f"{stat['kind']}/{stat['impl']} "
+                f"{stat['phase_timing']} "
+                f"count={stat['count']} "
+                f"timed={stat['duration_count']} "
+                f"sum_ms={stat['duration_sum_ms']:.3f} "
+                f"avg_ms={stat['duration_avg_ms']:.3f} "
+                f"max_ms={stat['duration_max_ms']:.3f}"
+            )
     if timed_event_stats:
         lines.append("  event_stats top_by_sum_ms:")
         for stat in sorted(timed_event_stats, key=lambda item: (-item["duration_sum_ms"], item["name"]))[:12]:
@@ -217,6 +252,8 @@ def format_runtime_events(summary: dict[str, Any]) -> str:
         duration_text = "" if duration is None else f" duration_ms={duration:.3f}"
         memory_text = _format_event_memory(event_summary)
         collective_text = _format_event_collective(event_summary)
+        workspace_text = _format_event_grad_workspace(event_summary)
+        materialization_text = _format_event_param_materialization(event_summary)
         lines.append(
             "  "
             f"#{event_summary['sequence']} "
@@ -228,6 +265,8 @@ def format_runtime_events(summary: dict[str, Any]) -> str:
             f"{duration_text}"
             f"{memory_text}"
             f"{collective_text}"
+            f"{workspace_text}"
+            f"{materialization_text}"
         )
     return "\n".join(lines)
 
@@ -299,7 +338,7 @@ def _summarize_communication_event_stats(events: list[dict[str, Any]]) -> list[d
 
 
 def _summarize_collective_event_stats(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    stats_by_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    stats_by_key: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     for event in events:
         kind = event.get("collective_kind")
         if not kind:
@@ -307,7 +346,8 @@ def _summarize_collective_event_stats(events: list[dict[str, Any]]) -> list[dict
         phase = _collective_event_phase(event["name"])
         backend = str(event.get("collective_backend") or "-")
         impl = str(event.get("collective_impl") or "-")
-        key = (str(phase), str(kind), backend, impl)
+        sync_mode = str(event.get("collective_sync_mode") or "-")
+        key = (str(phase), str(kind), backend, impl, sync_mode)
         stats = stats_by_key.setdefault(
             key,
             {
@@ -315,6 +355,7 @@ def _summarize_collective_event_stats(events: list[dict[str, Any]]) -> list[dict
                 "kind": str(kind),
                 "backend": backend,
                 "impl": impl,
+                "sync_mode": sync_mode,
                 "count": 0,
                 "duration_count": 0,
                 "duration_sum_ms": 0.0,
@@ -352,6 +393,60 @@ def _summarize_collective_event_stats(events: list[dict[str, Any]]) -> list[dict
             kind_order.get(stats["kind"], 99),
             stats["backend"],
             stats["impl"],
+            stats["sync_mode"],
+        ),
+    )
+
+
+def _summarize_collective_phase_timing_stats(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stats_by_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for event in events:
+        kind = event.get("collective_kind")
+        if not kind:
+            continue
+        phase_timings = event.get("collective_phase_timings") or {}
+        if not phase_timings:
+            continue
+        backend = str(event.get("collective_backend") or "-")
+        impl = str(event.get("collective_impl") or "-")
+        for phase_timing, duration in phase_timings.items():
+            key = (str(kind), backend, impl, str(phase_timing))
+            stats = stats_by_key.setdefault(
+                key,
+                {
+                    "kind": str(kind),
+                    "backend": backend,
+                    "impl": impl,
+                    "phase_timing": str(phase_timing),
+                    "count": 0,
+                    "duration_count": 0,
+                    "duration_sum_ms": 0.0,
+                    "duration_avg_ms": 0.0,
+                    "duration_max_ms": 0.0,
+                },
+            )
+            stats["count"] += 1
+            stats["duration_count"] += 1
+            stats["duration_sum_ms"] += float(duration)
+            stats["duration_max_ms"] = max(stats["duration_max_ms"], float(duration))
+    for stats in stats_by_key.values():
+        if stats["duration_count"]:
+            stats["duration_avg_ms"] = stats["duration_sum_ms"] / stats["duration_count"]
+    phase_order = {
+        "signature_validate_ms": 0,
+        "native_enqueue_ms": 1,
+        "torch_batch_enqueue_ms": 2,
+        "wait_ms": 3,
+    }
+    kind_order = {"param_all_gather": 0, "grad_reduce_scatter": 1}
+    return sorted(
+        stats_by_key.values(),
+        key=lambda stats: (
+            kind_order.get(stats["kind"], 99),
+            stats["backend"],
+            stats["impl"],
+            phase_order.get(stats["phase_timing"], 99),
+            stats["phase_timing"],
         ),
     )
 
@@ -359,7 +454,7 @@ def _summarize_collective_event_stats(events: list[dict[str, Any]]) -> list[dict
 def _communication_event_category(name: str) -> str | None:
     if name == "enqueue_all_gather_full_params":
         return "all_gather_enqueue"
-    if name.startswith("wait_unshard:"):
+    if name == "wait_all_gather_collective":
         return "all_gather_wait"
     if name in ("copy_in_grad_bucket", "copy_in_grad_bucket_for_accumulation"):
         return "grad_copy_in"
@@ -429,6 +524,10 @@ def _summarize_schedulers(
                 "forward_prefetch_budget_blocked": scheduler.forward_prefetch_budget_blocked,
                 "backward_prefetch_budget_blocked": scheduler.backward_prefetch_budget_blocked,
                 "backward_prefetch_memory_deferred": scheduler.backward_prefetch_memory_deferred,
+                "backward_prefetch_pending_reduce_waits": scheduler.backward_prefetch_pending_reduce_waits,
+                "owner_prefetch_waits_before_reduce": scheduler.owner_prefetch_waits_before_reduce,
+                "post_optimizer_events_recorded": scheduler.post_optimizer_events_recorded,
+                "post_optimizer_event_waits": scheduler.post_optimizer_event_waits,
                 "budget_blocked_prefetch_count": scheduler.budget_blocked_prefetch_count,
                 "backward_reduce_waits": scheduler.backward_reduce_waits,
                 "max_active_full_param_buffers": scheduler.max_active_full_param_buffers,
@@ -487,10 +586,50 @@ def _format_event_collective(event_summary: dict[str, Any]) -> str:
         f"backend={event_summary.get('collective_backend')}",
         f"impl={event_summary.get('collective_impl')}",
     ]
+    if event_summary.get("collective_sync_mode"):
+        fields.append(f"sync={event_summary['collective_sync_mode']}")
     if event_summary.get("collective_bytes"):
         fields.append(f"collective_bytes={event_summary['collective_bytes']}")
     if event_summary.get("collective_count"):
         fields.append(f"collective_count={event_summary['collective_count']}")
+    phase_timings = event_summary.get("collective_phase_timings") or {}
+    for phase_name, duration_ms in sorted(phase_timings.items()):
+        fields.append(f"{phase_name}={duration_ms:.3f}ms")
+    return " " + " ".join(fields)
+
+
+def _format_event_grad_workspace(event_summary: dict[str, Any]) -> str:
+    kind = event_summary.get("grad_bucket_workspace_kind")
+    if not kind:
+        return ""
+    fields = [
+        f"grad_workspace={kind}",
+        f"grad_workspace_numel={event_summary.get('grad_bucket_workspace_numel', 0)}",
+    ]
+    padding_waste = int(event_summary.get("grad_bucket_workspace_padding_waste_numel", 0) or 0)
+    if padding_waste:
+        fields.append(f"grad_workspace_pad={padding_waste}")
+    if event_summary.get("grad_bucket_workspace_persistent"):
+        fields.append("grad_workspace_persistent=True")
+    return " " + " ".join(fields)
+
+
+def _format_event_param_materialization(event_summary: dict[str, Any]) -> str:
+    kind = event_summary.get("param_materialization_kind")
+    if not kind:
+        return ""
+    fields = [
+        f"param_materialization={kind}",
+        f"param_materialization_numel={event_summary.get('param_materialization_numel', 0)}",
+    ]
+    if event_summary.get("param_materialization_bytes"):
+        fields.append(f"param_materialization_bytes={event_summary['param_materialization_bytes']}")
+    if event_summary.get("param_materialization_reused"):
+        fields.append("param_materialization_reused=True")
+    if event_summary.get("param_materialization_rank_chunk_fast_path"):
+        fields.append("param_materialization_rank_chunk=True")
+    if event_summary.get("param_materialization_packed_full_order"):
+        fields.append("param_materialization_full_order=True")
     return " " + " ".join(fields)
 
 
@@ -534,8 +673,14 @@ def _aggregate_communication_summaries(param_group_summaries: list[dict[str, Any
         for summary in communication_summaries
         if summary.get("workspace_preferred_kind") is not None
     )
+    param_buffer_type_counts = Counter(
+        str(summary.get("param_buffer_type"))
+        for summary in communication_summaries
+        if summary.get("param_buffer_type") is not None
+    )
     return {
         "num_param_groups": len(communication_summaries),
+        "param_buffer_type_counts": dict(sorted(param_buffer_type_counts.items())),
         "gather_backend_counts": dict(sorted(gather_backend_counts.items())),
         "resolved_custom_allgatherv_counts": dict(sorted(custom_impl_counts.items())),
         "grad_reduce_backend_counts": dict(sorted(grad_reduce_counts.items())),
@@ -582,6 +727,10 @@ def _aggregate_communication_summaries(param_group_summaries: list[dict[str, Any
         ),
         "workspace_total_allocate_count": sum(
             int(summary.get("workspace_allocate_count", 0)) for summary in communication_summaries
+        ),
+        "max_workspace_cache_limit": max(
+            (int(summary.get("workspace_max_cached_per_key", 0)) for summary in communication_summaries),
+            default=0,
         ),
         "max_workspace_allocated_numel": max(
             (int(summary.get("workspace_allocated_numel", 0)) for summary in communication_summaries),

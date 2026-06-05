@@ -8,9 +8,15 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
 
-from .planning.auto_planner import AutoPlannerPolicy, auto_group_plan, make_muon_shard_aware_group_planner
+from .planning.auto_planner import (
+    AutoPlannerPolicy,
+    auto_group_plan,
+    make_cost_aware_muon_shard_aware_group_planner,
+    make_muon_shard_aware_group_planner,
+    make_scoped_muon_shard_aware_group_planner,
+)
 from .runtime.param_group import MatrixFSDPNoSync, MatrixFSDPParamGroup
-from .core.managed_param import ParamShardHint
+from .core.managed_param import ManagedParamRegistry, ParamShardHint
 from .core.mesh import DataParallelMeshDims, MeshDim
 from .core.mixed_precision import validate_mixed_precision_policy, validate_offload_policy
 from .planning.planner import ShardPlan, hinted_ordered_group_plan
@@ -306,12 +312,35 @@ def matrix_fully_shard(
         if auto_planner_policy is not None:
             if group_planner is not None or layout_planner is not None:
                 raise ValueError("Pass either auto_planner_policy or an explicit group/layout planner, not both.")
-            group_planner = _resolve_auto_group_planner(
-                auto_planner_policy,
-                target_block_units=target_block_units,
-                rotation_strategy=rotation_strategy,
-                owner_assignment=owner_assignment,
-            )
+            if owner_assignment in {"scope_greedy", "cost_aware"}:
+                selected_modules = _collect_wrap_policy_modules(module, wrap_policy, ignored_params=ignored_params)
+                if not selected_modules:
+                    raise ValueError("wrap_policy did not select any modules to shard.")
+                scoped_param_groups = tuple(
+                    ManagedParamRegistry.from_module(
+                        selected_module,
+                        shard_hints=build_shard_hints(selected_module) if auto_shard_hints else None,
+                        ignored_params=ignored_params,
+                    ).params
+                    for selected_module in selected_modules
+                )
+                if owner_assignment == "cost_aware":
+                    group_planner = make_cost_aware_muon_shard_aware_group_planner(
+                        scoped_param_groups,
+                        policy=auto_planner_policy,
+                    )
+                else:
+                    group_planner = make_scoped_muon_shard_aware_group_planner(
+                        scoped_param_groups,
+                        policy=auto_planner_policy,
+                    )
+            else:
+                group_planner = _resolve_auto_group_planner(
+                    auto_planner_policy,
+                    target_block_units=target_block_units,
+                    rotation_strategy=rotation_strategy,
+                    owner_assignment=owner_assignment,
+                )
             auto_planner_policy = None
         wrapped_units = _apply_wrap_policy(
             module,
@@ -578,3 +607,17 @@ def _apply_wrap_policy(
             shrink_full_param_storage_after_backward=shrink_full_param_storage_after_backward,
         )
     return wrapped_units
+
+
+def _collect_wrap_policy_modules(
+    module: nn.Module,
+    wrap_policy: WrapPolicy,
+    *,
+    ignored_params: set[nn.Parameter] | None = None,
+) -> tuple[nn.Module, ...]:
+    if wrap_policy(module):
+        return (module,) if _module_has_unignored_params(module, ignored_params) else ()
+    selected: list[nn.Module] = []
+    for child in module.children():
+        selected.extend(_collect_wrap_policy_modules(child, wrap_policy, ignored_params=ignored_params))
+    return tuple(selected)

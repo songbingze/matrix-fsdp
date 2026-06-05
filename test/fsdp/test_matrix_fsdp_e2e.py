@@ -3,6 +3,7 @@ import inspect
 import tempfile
 import unittest
 from functools import partial
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -1550,6 +1551,131 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         self.assertEqual(stats["cached_buffers"], 0)
         self._assert_full_buffer_released_or_shrunk(unit.flat_buffer.full_buffer)
 
+    def test_scheduler_counts_pending_full_param_release_in_active_budget(self):
+        class FakeEvent:
+            def __init__(self) -> None:
+                self.complete = False
+
+            def query(self) -> bool:
+                return self.complete
+
+        model = matrix_fully_shard(nn.Linear(4, 4), reshard_after_forward=True)
+        optim = MatrixFSDPOptimizer(
+            torch.optim.SGD(model.parameters(), lr=0.1),
+            model,
+            max_cached_full_param_buffers_per_key=1,
+        )
+        buffer = torch.empty(16)
+        event = FakeEvent()
+
+        optim.scheduler.full_param_buffer_pool.release(buffer, cuda_event=event)
+        optim.scheduler.record_full_param_buffer_snapshot("pending_release")
+
+        self.assertEqual(optim.scheduler.full_param_buffer_snapshots[-1]["active_count"], 1)
+        self.assertEqual(optim.scheduler.full_param_buffer_snapshots[-1]["active_numel"], 16)
+
+        event.complete = True
+        optim.scheduler.record_full_param_buffer_snapshot("pending_release_drained")
+
+        self.assertEqual(optim.scheduler.full_param_buffer_snapshots[-1]["active_count"], 0)
+
+    def test_optimizer_step_records_post_optimizer_event(self):
+        torch.manual_seed(0)
+        model = matrix_fully_shard(nn.Linear(4, 2))
+        optim = MatrixFSDPOptimizer(torch.optim.SGD(model.parameters(), lr=0.1), model)
+        recorder = mock.Mock(return_value=False)
+        optim.scheduler.record_post_optimizer_event = recorder
+
+        loss = model(torch.randn(3, 4)).sum()
+        loss.backward()
+        optim.step()
+
+        recorder.assert_called_once_with()
+
+    def test_start_unshard_waits_for_post_optimizer_event_before_all_gather(self):
+        model = matrix_fully_shard(nn.Linear(4, 2))
+        optim = MatrixFSDPOptimizer(torch.optim.SGD(model.parameters(), lr=0.1), model)
+        unit = model._matrix_fsdp_param_group
+        waiter = mock.Mock(return_value=True)
+        optim.scheduler.wait_for_post_optimizer_event_before_all_gather = waiter
+
+        unit.start_unshard("explicit")
+
+        waiter.assert_called_once_with()
+        self.assertIn(
+            "wait_post_optimizer_event_before_all_gather",
+            [event.name for event in unit.runtime_events],
+        )
+
+    def test_lifecycle_transition_events_cover_forward_backward_step(self):
+        torch.manual_seed(0)
+        model = matrix_fully_shard(nn.Linear(4, 2), reshard_after_forward=True)
+        optim = MatrixFSDPOptimizer(torch.optim.SGD(model.parameters(), lr=0.1), model)
+        unit = model._matrix_fsdp_param_group
+
+        loss = model(torch.randn(3, 4)).sum()
+        loss.backward()
+        optim.step()
+
+        event_names = [event.name for event in unit.runtime_events]
+        self.assertIn(
+            "lifecycle_transition:sharded->unsharded:start_unshard:pre_forward",
+            event_names,
+        )
+        self.assertIn(
+            "lifecycle_transition:unsharded->forward_resharded:reshard_after_forward",
+            event_names,
+        )
+        self.assertIn(
+            "lifecycle_transition:forward_resharded->unsharded:start_unshard:pre_backward",
+            event_names,
+        )
+        self.assertTrue(
+            "lifecycle_transition:unsharded->sharded:reshard_before_reduce_grad" in event_names
+            or "lifecycle_transition:unsharded->sharded:finish_backward" in event_names
+        )
+
+    def test_lifecycle_transition_rejects_invalid_state_change(self):
+        model = matrix_fully_shard(nn.Linear(4, 2))
+        unit = model._matrix_fsdp_param_group
+
+        with self.assertRaisesRegex(RuntimeError, "Invalid MatrixFSDP lifecycle transition"):
+            unit._transition_lifecycle_state(
+                FSDPLifecycleState.FORWARD_RESHARDED,
+                reason="test_invalid_transition",
+                allowed_from=(FSDPLifecycleState.UNSHARDED,),
+            )
+
+    def test_lifecycle_invariants_reject_inflight_unshard_without_handle(self):
+        model = matrix_fully_shard(nn.Linear(4, 2))
+        unit = model._matrix_fsdp_param_group
+        unit._unshard_inflight = True
+
+        with self.assertRaisesRegex(RuntimeError, "in-flight unshard"):
+            unit._validate_lifecycle_invariants("test_invalid_inflight")
+
+    def test_optimizer_ready_rejects_unsharded_params(self):
+        model = matrix_fully_shard(nn.Linear(4, 2))
+        unit = model._matrix_fsdp_param_group
+
+        unit.unshard()
+
+        with self.assertRaisesRegex(RuntimeError, "expects MatrixFSDP parameters to be sharded"):
+            unit.assert_optimizer_ready("test_optimizer_ready")
+
+    def test_optimizer_step_checks_param_groups_are_optimizer_ready(self):
+        torch.manual_seed(0)
+        model = matrix_fully_shard(nn.Linear(4, 2))
+        optim = MatrixFSDPOptimizer(torch.optim.SGD(model.parameters(), lr=0.1), model)
+        unit = model._matrix_fsdp_param_group
+
+        loss = model(torch.randn(3, 4)).sum()
+        loss.backward()
+        with mock.patch.object(unit, "assert_optimizer_ready", wraps=unit.assert_optimizer_ready) as checker:
+            optim.step()
+
+        checker.assert_called_once_with("optimizer.step")
+
     def test_finalize_backward_requires_unsharded_state(self):
         model = matrix_fully_shard(nn.Linear(4, 2))
 
@@ -1967,7 +2093,13 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         self.assertIn("prepare_grad_bucket_copy_in", event_names)
         self.assertIn("collect_grad_bucket", event_names)
         self.assertIn("reshard_before_reduce_grad", event_names)
+        self.assertTrue(any(name.startswith("full_param_buffer_clear:pre_reduce_grad:") for name in event_names))
+        self.assertIn("before_backward_reduce_scheduler_runtime", event_names)
         self.assertIn("reduce_grad_bucket", event_names)
+        self.assertIn("after_backward_reduce_started_scheduler_runtime", event_names)
+        self.assertIn("post_backward_reshard_scheduler_runtime", event_names)
+        self.assertIn("wait_reduce_grad_bucket_handle", event_names)
+        self.assertIn("materialize_reduced_local_grad_shard", event_names)
         self.assertIn("wait_reduce_grad_bucket", event_names)
         self.assertFalse(unit.has_pending_backward_reduce)
         sharded_optim.step()
@@ -2633,8 +2765,14 @@ class MatrixFSDPE2ETest(unittest.TestCase):
             local_shard = None
             matrix_collective_backend = "custom"
 
+            def __init__(self, *, independent_comm_lanes: bool = False):
+                self.independent_comm_lanes = independent_comm_lanes
+
             def owner_segment_prefetch_order_gate_required(self):
                 return True
+
+            def owner_segment_collective_has_independent_comm_lanes(self):
+                return self.independent_comm_lanes
 
         class FakeRuntimeMetadata:
             def __init__(self, index):
@@ -2650,6 +2788,9 @@ class MatrixFSDPE2ETest(unittest.TestCase):
                 self._forward_prefetched = False
                 self._backward_prefetched = False
                 self.events = []
+                self.forward_prefetch_kwargs = []
+                self.backward_prefetch_kwargs = []
+                self.has_pending_backward_reduce = False
 
             def set_scheduler(self, scheduler):
                 self.scheduler = scheduler
@@ -2661,14 +2802,24 @@ class MatrixFSDPE2ETest(unittest.TestCase):
                 self.pool = pool
 
             def prefetch_forward(self, **kwargs):
+                self.forward_prefetch_kwargs.append(kwargs)
                 self._forward_prefetched = True
                 self.events.append("forward_prefetch")
                 return True
 
             def prefetch_backward(self, **kwargs):
+                self.backward_prefetch_kwargs.append(kwargs)
                 self._backward_prefetched = True
                 self.events.append("backward_prefetch")
                 return True
+
+            def wait_post_backward_reduce(self):
+                self.has_pending_backward_reduce = False
+                self.events.append("wait_post_backward_reduce")
+
+            def wait_unshard(self, reason):
+                self._unshard_inflight = False
+                self.events.append(f"wait_unshard:{reason}")
 
             def _record_event(self, name):
                 self.events.append(name)
@@ -2686,14 +2837,25 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         self.assertEqual(units[1].events.count("forward_prefetch"), 1)
         self.assertEqual(units[2].events.count("forward_prefetch"), 1)
         self.assertEqual(scheduler.forward_prefetch_issued, 2)
+        for unit in units[1:]:
+            self.assertEqual(
+                unit.forward_prefetch_kwargs,
+                [{"validate_owner_collective_signature": True, "ordered_owner_collective": True}],
+            )
 
     def test_owner_prefetch_queue_enforces_backward_post_forward_order(self):
         class FakeOwnerFlatBuffer:
             local_shard = None
             matrix_collective_backend = "custom"
 
+            def __init__(self, *, independent_comm_lanes: bool = False):
+                self.independent_comm_lanes = independent_comm_lanes
+
             def owner_segment_prefetch_order_gate_required(self):
                 return True
+
+            def owner_segment_collective_has_independent_comm_lanes(self):
+                return self.independent_comm_lanes
 
         class FakeRuntimeMetadata:
             def __init__(self, index):
@@ -2709,6 +2871,9 @@ class MatrixFSDPE2ETest(unittest.TestCase):
                 self._forward_prefetched = False
                 self._backward_prefetched = False
                 self.events = []
+                self.forward_prefetch_kwargs = []
+                self.backward_prefetch_kwargs = []
+                self.has_pending_backward_reduce = False
 
             def set_scheduler(self, scheduler):
                 self.scheduler = scheduler
@@ -2720,14 +2885,24 @@ class MatrixFSDPE2ETest(unittest.TestCase):
                 self.pool = pool
 
             def prefetch_forward(self, **kwargs):
+                self.forward_prefetch_kwargs.append(kwargs)
                 self._forward_prefetched = True
                 self.events.append("forward_prefetch")
                 return True
 
             def prefetch_backward(self, **kwargs):
+                self.backward_prefetch_kwargs.append(kwargs)
                 self._backward_prefetched = True
                 self.events.append("backward_prefetch")
                 return True
+
+            def wait_post_backward_reduce(self):
+                self.has_pending_backward_reduce = False
+                self.events.append("wait_post_backward_reduce")
+
+            def wait_unshard(self, reason):
+                self._unshard_inflight = False
+                self.events.append(f"wait_unshard:{reason}")
 
             def _record_event(self, name):
                 self.events.append(name)
@@ -2747,6 +2922,293 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         self.assertEqual(units[1].events.count("backward_prefetch"), 1)
         self.assertEqual(units[0].events.count("backward_prefetch"), 1)
         self.assertEqual(scheduler.backward_prefetch_issued, 2)
+        for unit in units[:2]:
+            self.assertEqual(
+                unit.backward_prefetch_kwargs,
+                [{"validate_owner_collective_signature": True, "ordered_owner_collective": True}],
+            )
+
+        units = [FakeUnit(index) for index in range(3)]
+        scheduler = MatrixFSDPScheduler(units, max_unsharded_prefetch_units=1)
+        for unit in units:
+            scheduler.record_post_forward(unit)
+        units[2].has_pending_backward_reduce = True
+        scheduler._pending_backward_reduce_units.append(units[2])
+
+        scheduler.on_pre_backward(units[2])
+
+        self.assertNotIn("wait_post_backward_reduce", units[2].events)
+        self.assertNotIn("backward_prefetch", units[1].events)
+        self.assertIn("backward_prefetch_skipped:owner_ordered_queue:pending_reduce", " ".join(units[1].events))
+        self.assertEqual(scheduler.backward_prefetch_memory_deferred, 1)
+
+        units = [FakeUnit(index) for index in range(3)]
+        units[1].flat_buffer = FakeOwnerFlatBuffer(independent_comm_lanes=True)
+        scheduler = MatrixFSDPScheduler(units, max_unsharded_prefetch_units=1)
+        for unit in units:
+            scheduler.record_post_forward(unit)
+        units[2].has_pending_backward_reduce = True
+        scheduler._pending_backward_reduce_units.append(units[2])
+
+        scheduler.on_pre_backward(units[2])
+
+        self.assertIn("backward_prefetch", units[1].events)
+        self.assertEqual(scheduler.backward_prefetch_issued, 1)
+        self.assertEqual(scheduler.backward_prefetch_memory_deferred, 0)
+
+        units = [FakeUnit(index) for index in range(3)]
+        scheduler = MatrixFSDPScheduler(units, max_unsharded_prefetch_units=1)
+        for unit in units:
+            scheduler.record_post_forward(unit)
+        units[2].has_pending_backward_reduce = True
+        scheduler._pending_backward_reduce_units.append(units[2])
+
+        with unittest.mock.patch.dict(
+            "os.environ",
+            {"MATRIX_FSDP_OWNER_BACKWARD_PREFETCH_WAIT_PENDING_REDUCE": "1"},
+        ):
+            scheduler.on_pre_backward(units[2])
+
+        self.assertIn("wait_post_backward_reduce", units[2].events)
+        self.assertIn("backward_prefetch", units[1].events)
+        self.assertIn(
+            "backward_prefetch_skipped:owner_ordered_queue:waited_pending_reduce",
+            " ".join(units[1].events),
+        )
+        self.assertEqual(scheduler.backward_prefetch_pending_reduce_waits, 1)
+
+        units = [FakeUnit(index) for index in range(3)]
+        scheduler = MatrixFSDPScheduler(units, max_unsharded_prefetch_units=1)
+        units[1]._backward_prefetched = True
+        units[1]._unshard_inflight = True
+
+        scheduler.before_backward_reduce(units[2])
+
+        self.assertIn("wait_unshard:owner_prefetch_before_reduce", units[1].events)
+        self.assertEqual(scheduler.owner_prefetch_waits_before_reduce, 1)
+
+    def test_owner_prefetch_queue_fills_forward_budget_window(self):
+        class FakeOwnerFlatBuffer:
+            local_shard = None
+            matrix_collective_backend = "custom"
+
+            def owner_segment_prefetch_order_gate_required(self):
+                return True
+
+            def owner_segment_collective_has_independent_comm_lanes(self):
+                return True
+
+        class FakeRuntimeMetadata:
+            def __init__(self, index):
+                self.runtime_param_group_id = f"param_group_{index}"
+
+        class FakeUnit:
+            def __init__(self, index):
+                self.forward_prefetch_enabled = True
+                self.backward_prefetch_enabled = True
+                self.flat_buffer = FakeOwnerFlatBuffer()
+                self.runtime_metadata = FakeRuntimeMetadata(index)
+                self.world_size = 8
+                self._forward_prefetched = False
+                self._backward_prefetched = False
+                self.has_pending_backward_reduce = False
+                self.events = []
+
+            def set_scheduler(self, scheduler):
+                self.scheduler = scheduler
+
+            def set_comm_context(self, comm_context):
+                self.comm_context = comm_context
+
+            def set_full_param_buffer_pool(self, pool):
+                self.pool = pool
+
+            def prefetch_forward(self, **kwargs):
+                self._forward_prefetched = True
+                self.events.append("forward_prefetch")
+                return True
+
+            def prefetch_backward(self, **kwargs):
+                self._backward_prefetched = True
+                self.events.append("backward_prefetch")
+                return True
+
+            def wait_post_backward_reduce(self):
+                self.has_pending_backward_reduce = False
+
+            def wait_unshard(self, reason):
+                self._unshard_inflight = False
+
+            def _record_event(self, name):
+                self.events.append(name)
+
+        units = [FakeUnit(index) for index in range(4)]
+        scheduler = MatrixFSDPScheduler(units, max_unsharded_prefetch_units=2)
+
+        scheduler.on_pre_forward(units[0])
+
+        self.assertEqual(units[1].events.count("forward_prefetch"), 1)
+        self.assertEqual(units[2].events.count("forward_prefetch"), 1)
+        self.assertEqual(units[3].events.count("forward_prefetch"), 0)
+        self.assertEqual(scheduler.forward_prefetch_issued, 2)
+
+        scheduler.on_pre_forward(units[1])
+
+        self.assertEqual(units[3].events.count("forward_prefetch"), 1)
+        self.assertEqual(scheduler.forward_prefetch_issued, 3)
+
+    def test_owner_prefetch_queue_refills_forward_window_after_post_forward(self):
+        class FakeOwnerFlatBuffer:
+            matrix_collective_backend = "custom"
+
+            def __init__(self):
+                class FakePlan:
+                    total_numel = 1
+
+                self.plan = FakePlan()
+                self.local_shard = torch.empty(1)
+                self.full_buffer = None
+
+            def owner_segment_prefetch_order_gate_required(self):
+                return True
+
+            def owner_segment_collective_has_independent_comm_lanes(self):
+                return True
+
+        class FakeRuntimeMetadata:
+            def __init__(self, index):
+                self.runtime_param_group_id = f"param_group_{index}"
+
+        class FakeUnit:
+            def __init__(self, index):
+                self.forward_prefetch_enabled = True
+                self.backward_prefetch_enabled = True
+                self.flat_buffer = FakeOwnerFlatBuffer()
+                self.runtime_metadata = FakeRuntimeMetadata(index)
+                self.world_size = 8
+                self._forward_prefetched = False
+                self._backward_prefetched = False
+                self.has_pending_backward_reduce = False
+                self.events = []
+
+            def set_scheduler(self, scheduler):
+                self.scheduler = scheduler
+
+            def set_comm_context(self, comm_context):
+                self.comm_context = comm_context
+
+            def set_full_param_buffer_pool(self, pool):
+                self.pool = pool
+
+            def prefetch_forward(self, **kwargs):
+                self._forward_prefetched = True
+                self.flat_buffer.full_buffer = torch.empty(1)
+                self.events.append("forward_prefetch")
+                return True
+
+            def prefetch_backward(self, **kwargs):
+                self._backward_prefetched = True
+                self.events.append("backward_prefetch")
+                return True
+
+            def wait_post_backward_reduce(self):
+                self.has_pending_backward_reduce = False
+
+            def wait_unshard(self, reason):
+                self._unshard_inflight = False
+
+            def _record_event(self, name):
+                self.events.append(name)
+
+        units = [FakeUnit(index) for index in range(4)]
+        units[0].flat_buffer.full_buffer = torch.empty(1)
+        scheduler = MatrixFSDPScheduler(units, max_unsharded_prefetch_units=2, max_active_full_param_buffers=2)
+
+        scheduler.on_pre_forward(units[0])
+
+        self.assertEqual(units[1].events.count("forward_prefetch"), 1)
+        self.assertEqual(units[2].events.count("forward_prefetch"), 0)
+        self.assertEqual(units[3].events.count("forward_prefetch"), 0)
+
+        units[0]._forward_prefetched = False
+        units[0].flat_buffer.full_buffer = None
+        scheduler.record_post_forward(units[0])
+
+        self.assertEqual(units[2].events.count("forward_prefetch"), 1)
+        self.assertEqual(units[3].events.count("forward_prefetch"), 0)
+        self.assertEqual(scheduler.forward_prefetch_issued, 2)
+
+    def test_owner_prefetch_queue_fills_backward_budget_window(self):
+        class FakeOwnerFlatBuffer:
+            local_shard = None
+            matrix_collective_backend = "custom"
+
+            def owner_segment_prefetch_order_gate_required(self):
+                return True
+
+            def owner_segment_collective_has_independent_comm_lanes(self):
+                return True
+
+        class FakeRuntimeMetadata:
+            def __init__(self, index):
+                self.runtime_param_group_id = f"param_group_{index}"
+
+        class FakeUnit:
+            def __init__(self, index):
+                self.forward_prefetch_enabled = True
+                self.backward_prefetch_enabled = True
+                self.flat_buffer = FakeOwnerFlatBuffer()
+                self.runtime_metadata = FakeRuntimeMetadata(index)
+                self.world_size = 8
+                self._forward_prefetched = False
+                self._backward_prefetched = False
+                self.has_pending_backward_reduce = False
+                self.events = []
+
+            def set_scheduler(self, scheduler):
+                self.scheduler = scheduler
+
+            def set_comm_context(self, comm_context):
+                self.comm_context = comm_context
+
+            def set_full_param_buffer_pool(self, pool):
+                self.pool = pool
+
+            def prefetch_forward(self, **kwargs):
+                self._forward_prefetched = True
+                self.events.append("forward_prefetch")
+                return True
+
+            def prefetch_backward(self, **kwargs):
+                self._backward_prefetched = True
+                self.events.append("backward_prefetch")
+                return True
+
+            def wait_post_backward_reduce(self):
+                self.has_pending_backward_reduce = False
+
+            def wait_unshard(self, reason):
+                self._unshard_inflight = False
+
+            def _record_event(self, name):
+                self.events.append(name)
+
+        units = [FakeUnit(index) for index in range(4)]
+        scheduler = MatrixFSDPScheduler(units, max_backward_prefetch_units=2)
+        for unit in units:
+            scheduler.record_post_forward(unit)
+
+        scheduler.on_pre_backward(units[3])
+
+        self.assertEqual(units[2].events.count("backward_prefetch"), 1)
+        self.assertEqual(units[1].events.count("backward_prefetch"), 1)
+        self.assertEqual(units[0].events.count("backward_prefetch"), 0)
+        self.assertEqual(scheduler.backward_prefetch_issued, 2)
+
+        scheduler.on_pre_backward(units[2])
+
+        self.assertEqual(units[0].events.count("backward_prefetch"), 1)
+        self.assertEqual(scheduler.backward_prefetch_issued, 3)
 
     def test_mixed_optimizer_inner_adamw_does_not_replace_unit_scheduler(self):
         model = matrix_fully_shard(nn.Linear(4, 2))
@@ -2984,8 +3446,9 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         self.assertFalse(optim.scheduler.trim_cuda_cache)
         self.assertFalse(optim.scheduler.maybe_trim_cuda_cache())
         for unit in optim.runtime_param_groups:
-            stats = unit.flat_buffer.elastic_param_buffer.workspace.stats()
-            self.assertEqual(stats["workspace_max_cached_per_key"], 0)
+            for param_buffer in (unit.flat_buffer.static_param_buffer, unit.flat_buffer.elastic_param_buffer):
+                stats = param_buffer.workspace.stats()
+                self.assertEqual(stats["workspace_max_cached_per_key"], 0)
 
     def test_api_defaults_to_fast_copy_in_no_saved_hooks_path(self):
         model = matrix_fully_shard(nn.Linear(4, 2))
@@ -3023,8 +3486,9 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         self.assertTrue(optim.scheduler.trim_cuda_cache)
         self.assertEqual(optim.scheduler.full_param_buffer_pool.stats()["max_cached_per_key"], 2)
         for unit in optim.runtime_param_groups:
-            stats = unit.flat_buffer.elastic_param_buffer.workspace.stats()
-            self.assertEqual(stats["workspace_max_cached_per_key"], 1)
+            for param_buffer in (unit.flat_buffer.static_param_buffer, unit.flat_buffer.elastic_param_buffer):
+                stats = param_buffer.workspace.stats()
+                self.assertEqual(stats["workspace_max_cached_per_key"], 1)
 
     def test_optimizer_rejects_scheduler_config_with_explicit_scheduler_kwargs(self):
         model = matrix_fully_shard(nn.Linear(4, 2))

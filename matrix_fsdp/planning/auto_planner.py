@@ -13,6 +13,7 @@ from matrix_fsdp.planning.planner import (
     expert_owner_tail_plan,
     hint_aware_block_builder,
     hinted_ordered_group_plan,
+    load_balanced_matrix_owner_tail_group_plans,
     load_balanced_matrix_owner_tail_plan,
     ordered_group_plan,
     ordered_matrix_owner_tail_plan,
@@ -99,6 +100,9 @@ class AutoPlannerReportRow:
     total_comm_bytes: int
     max_rank_comm_bytes: int
     muon_param_imbalance_bytes: int
+    workspace_preferred_numel: int
+    workspace_padding_waste_numel: int
+    workspace_padding_waste_ratio: float
     estimated_padding_units: int
     estimated_collectives: int
     candidate_padding_units: int
@@ -267,6 +271,9 @@ MUON_SHARD_AWARE_POLICY = AutoPlannerPolicy(
         total_comm_byte=0.000001,
         max_rank_comm_byte=0.000002,
         comm_imbalance_byte=0.000001,
+        workspace_preferred_unit=0.000001,
+        workspace_padding_unit=0.000005,
+        workspace_padding_ratio=10.0,
     ),
 )
 DEBUG_POLICY = AutoPlannerPolicy(
@@ -447,6 +454,8 @@ def format_auto_planner_report(rows: Sequence[AutoPlannerReportRow]) -> str:
         "rank_adamw",
         "expert_owners",
         "rank_roles",
+        "workspace",
+        "ws_pad",
         "cand_pad",
         "cand_coll",
         "warnings",
@@ -476,6 +485,8 @@ def format_auto_planner_report(rows: Sequence[AutoPlannerReportRow]) -> str:
             _format_int_tuple(row.rank_adamw_param_bytes),
             _format_expert_owner_groups(row.expert_owner_groups),
             _format_rank_role_units(row.rank_role_units),
+            str(row.workspace_preferred_numel),
+            f"{row.workspace_padding_waste_ratio:.3f}",
             str(row.candidate_padding_units),
             str(row.candidate_collectives),
             _format_strings(row.warnings),
@@ -510,13 +521,16 @@ def make_muon_shard_aware_group_planner(
     rotation strategy greedily chooses the next rank offset from cumulative
     per-rank load. ``owner_assignment="role_greedy"`` instead assigns each
     matrix/tail role directly to the currently lightest rank.
+    ``owner_assignment="cost_aware"`` is accepted for API symmetry with
+    wrap-policy look-ahead planners; for a single online group it resolves to
+    the role-greedy path because no future groups are visible.
     """
 
     valid_strategies = {"greedy_balance", "round_robin"}
     if rotation_strategy not in valid_strategies:
         valid = ", ".join(sorted(valid_strategies))
         raise ValueError(f"Unknown rotation_strategy={rotation_strategy!r}. Valid strategies: {valid}.")
-    valid_owner_assignments = {"rotate", "role_greedy"}
+    valid_owner_assignments = {"rotate", "role_greedy", "cost_aware"}
     if owner_assignment not in valid_owner_assignments:
         valid = ", ".join(sorted(valid_owner_assignments))
         raise ValueError(f"Unknown owner_assignment={owner_assignment!r}. Valid assignments: {valid}.")
@@ -528,7 +542,7 @@ def make_muon_shard_aware_group_planner(
         nonlocal cumulative_rank_units, unit_index
         if cumulative_rank_units is None or len(cumulative_rank_units) != world_size:
             cumulative_rank_units = [0 for _ in range(world_size)]
-        if owner_assignment == "role_greedy":
+        if owner_assignment in {"role_greedy", "cost_aware"}:
             evaluation = _load_balanced_matrix_owner_tail_evaluation(
                 params,
                 world_size,
@@ -568,6 +582,141 @@ def make_muon_shard_aware_group_planner(
     return group_planner
 
 
+def make_scoped_muon_shard_aware_group_planner(
+    param_groups: Sequence[Sequence[ManagedParam]],
+    *,
+    policy: str | AutoPlannerPolicy = "muon_shard_aware",
+    initial_rank_units: Sequence[int] | None = None,
+) -> MuonShardAwareGroupPlanner:
+    """
+    Build a look-ahead Muon owner planner for multiple runtime groups.
+
+    Each returned layout remains scoped to a single runtime param group. Only the
+    owner assignment is planned across ``param_groups``. This keeps computation
+    and materialization at block granularity while balancing full-matrix owner
+    load over a larger planner scope.
+    """
+
+    planned_by_world_size: dict[int, tuple[PlannerEvaluation, ...]] = {}
+    next_index_by_world_size: dict[int, int] = {}
+
+    def build(world_size: int) -> tuple[PlannerEvaluation, ...]:
+        resolved_policy = resolve_auto_planner_policy(policy)
+        layouts = load_balanced_matrix_owner_tail_group_plans(
+            param_groups,
+            world_size,
+            initial_rank_units=initial_rank_units,
+            merge_adjacent_rank_segments=True,
+        )
+        return tuple(
+            planner_result_from_output(
+                "matrix_owner_tail_scope_greedy",
+                layout,
+                params,
+                world_size,
+                blocks=_matrix_owner_tail_blocks(params),
+                weights=resolved_policy.weights,
+                policy=resolved_policy.name,
+            )
+            for params, layout in zip(param_groups, layouts)
+        )
+
+    def group_planner(params: Sequence[ManagedParam], world_size: int) -> PlannerResult:
+        if world_size not in planned_by_world_size:
+            planned_by_world_size[world_size] = build(world_size)
+            next_index_by_world_size[world_size] = 0
+        planned = planned_by_world_size[world_size]
+        next_index = next_index_by_world_size[world_size]
+        if next_index >= len(planned):
+            raise RuntimeError(
+                "Scoped Muon shard-aware planner was called more times than the number of planned groups."
+            )
+        expected = planned[next_index]
+        expected_signature = tuple((param.fqn, param.numel) for param in param_groups[next_index])
+        actual_signature = tuple((param.fqn, param.numel) for param in params)
+        if actual_signature != expected_signature:
+            raise RuntimeError(
+                "Scoped Muon shard-aware planner call order does not match the planned wrap-policy order."
+            )
+        next_index_by_world_size[world_size] = next_index + 1
+        return expected
+
+    return group_planner
+
+
+def make_cost_aware_muon_shard_aware_group_planner(
+    param_groups: Sequence[Sequence[ManagedParam]],
+    *,
+    policy: str | AutoPlannerPolicy = "muon_shard_aware",
+    initial_rank_units: Sequence[int] | None = None,
+    max_workspace_ratio: float = 1.35,
+    max_workspace_padding_ratio: float = 3.0,
+) -> MuonShardAwareGroupPlanner:
+    """
+    Build a look-ahead Muon planner that chooses role- or scope-greedy owners.
+
+    Scope-greedy ownership can improve global rank balance, but it may also
+    create much larger per-runtime-group owner chunks. Those chunks inflate the
+    padded communication/materialization workspace. The cost-aware planner
+    accepts the scope plan only when it improves global rank balance without
+    exceeding workspace growth caps; otherwise it falls back to the online
+    role-greedy plan.
+    """
+
+    planned_by_world_size: dict[int, tuple[PlannerEvaluation, ...]] = {}
+    next_index_by_world_size: dict[int, int] = {}
+
+    def build(world_size: int) -> tuple[PlannerEvaluation, ...]:
+        role_plans = _build_role_greedy_muon_owner_plans(
+            param_groups,
+            world_size,
+            policy=policy,
+            initial_rank_units=initial_rank_units,
+        )
+        scope_plans = _build_scope_greedy_muon_owner_plans(
+            param_groups,
+            world_size,
+            policy=policy,
+            initial_rank_units=initial_rank_units,
+        )
+        selected_plans = _select_cost_aware_owner_plans(
+            role_plans,
+            scope_plans,
+            max_workspace_ratio=max_workspace_ratio,
+            max_workspace_padding_ratio=max_workspace_padding_ratio,
+        )
+        return tuple(
+            replace(
+                evaluation,
+                policy=(policy.name if isinstance(policy, AutoPlannerPolicy) else policy),
+                warnings=(*evaluation.warnings, f"cost_aware_owner_assignment={_cost_aware_owner_assignment_name(evaluation)}"),
+            )
+            for evaluation in selected_plans
+        )
+
+    def group_planner(params: Sequence[ManagedParam], world_size: int) -> PlannerResult:
+        if world_size not in planned_by_world_size:
+            planned_by_world_size[world_size] = build(world_size)
+            next_index_by_world_size[world_size] = 0
+        planned = planned_by_world_size[world_size]
+        next_index = next_index_by_world_size[world_size]
+        if next_index >= len(planned):
+            raise RuntimeError(
+                "Cost-aware Muon shard-aware planner was called more times than the number of planned groups."
+            )
+        expected = planned[next_index]
+        expected_signature = tuple((param.fqn, param.numel) for param in param_groups[next_index])
+        actual_signature = tuple((param.fqn, param.numel) for param in params)
+        if actual_signature != expected_signature:
+            raise RuntimeError(
+                "Cost-aware Muon shard-aware planner call order does not match the planned wrap-policy order."
+            )
+        next_index_by_world_size[world_size] = next_index + 1
+        return expected
+
+    return group_planner
+
+
 def _load_balanced_matrix_owner_tail_evaluation(
     params: Sequence[ManagedParam],
     world_size: int,
@@ -591,6 +740,121 @@ def _load_balanced_matrix_owner_tail_evaluation(
         weights=resolved_policy.weights,
         policy=resolved_policy.name,
     )
+
+
+def _build_role_greedy_muon_owner_plans(
+    param_groups: Sequence[Sequence[ManagedParam]],
+    world_size: int,
+    *,
+    policy: str | AutoPlannerPolicy,
+    initial_rank_units: Sequence[int] | None,
+) -> tuple[PlannerEvaluation, ...]:
+    cumulative_rank_units = [0 for _ in range(world_size)] if initial_rank_units is None else list(initial_rank_units)
+    if len(cumulative_rank_units) != world_size:
+        raise ValueError(
+            f"initial_rank_units length must match world_size={world_size}, got {len(cumulative_rank_units)}."
+        )
+    evaluations = []
+    for params in param_groups:
+        evaluation = _load_balanced_matrix_owner_tail_evaluation(
+            params,
+            world_size,
+            initial_rank_units=cumulative_rank_units,
+            policy=policy,
+        )
+        evaluations.append(evaluation)
+        for rank, units in enumerate(evaluation.layout.shard_sizes):
+            cumulative_rank_units[rank] += units
+    return tuple(evaluations)
+
+
+def _build_scope_greedy_muon_owner_plans(
+    param_groups: Sequence[Sequence[ManagedParam]],
+    world_size: int,
+    *,
+    policy: str | AutoPlannerPolicy,
+    initial_rank_units: Sequence[int] | None,
+) -> tuple[PlannerEvaluation, ...]:
+    resolved_policy = resolve_auto_planner_policy(policy)
+    layouts = load_balanced_matrix_owner_tail_group_plans(
+        param_groups,
+        world_size,
+        initial_rank_units=initial_rank_units,
+        merge_adjacent_rank_segments=True,
+    )
+    return tuple(
+        planner_result_from_output(
+            "matrix_owner_tail_scope_greedy",
+            layout,
+            params,
+            world_size,
+            blocks=_matrix_owner_tail_blocks(params),
+            weights=resolved_policy.weights,
+            policy=resolved_policy.name,
+        )
+        for params, layout in zip(param_groups, layouts)
+    )
+
+
+def _select_cost_aware_owner_plans(
+    role_plans: Sequence[PlannerEvaluation],
+    scope_plans: Sequence[PlannerEvaluation],
+    *,
+    max_workspace_ratio: float,
+    max_workspace_padding_ratio: float,
+) -> tuple[PlannerEvaluation, ...]:
+    role_stats = _owner_plan_stats(role_plans)
+    scope_stats = _owner_plan_stats(scope_plans)
+    scope_improves_balance = (
+        scope_stats["rank_imbalance"] < role_stats["rank_imbalance"]
+        or scope_stats["max_rank_units"] < role_stats["max_rank_units"]
+    )
+    workspace_within_limit = (
+        scope_stats["max_workspace_numel"] <= role_stats["max_workspace_numel"] * max_workspace_ratio
+        and scope_stats["total_workspace_numel"] <= role_stats["total_workspace_numel"] * max_workspace_ratio
+        and scope_stats["max_workspace_padding_ratio"] <= max_workspace_padding_ratio
+    )
+    if scope_improves_balance and workspace_within_limit:
+        return tuple(scope_plans)
+    return tuple(role_plans)
+
+
+def _owner_plan_stats(plans: Sequence[PlannerEvaluation]) -> dict[str, float]:
+    if not plans:
+        return {
+            "rank_imbalance": 0.0,
+            "max_rank_units": 0.0,
+            "total_workspace_numel": 0.0,
+            "max_workspace_numel": 0.0,
+            "max_workspace_padding_ratio": 0.0,
+        }
+    world_size = plans[0].world_size
+    rank_totals = [0 for _ in range(world_size)]
+    total_workspace_numel = 0
+    max_workspace_numel = 0
+    max_workspace_padding_ratio = 0.0
+    for evaluation in plans:
+        for rank, units in enumerate(evaluation.layout.shard_sizes):
+            rank_totals[rank] += units
+        resources = evaluation.resource_estimate or PlannerResourceEstimate.empty(world_size)
+        total_workspace_numel += resources.workspace_preferred_numel
+        max_workspace_numel = max(max_workspace_numel, resources.workspace_preferred_numel)
+        max_workspace_padding_ratio = max(max_workspace_padding_ratio, resources.workspace_padding_waste_ratio)
+    return {
+        "rank_imbalance": float(max(rank_totals, default=0) - min(rank_totals, default=0)),
+        "max_rank_units": float(max(rank_totals, default=0)),
+        "total_workspace_numel": float(total_workspace_numel),
+        "max_workspace_numel": float(max_workspace_numel),
+        "max_workspace_padding_ratio": float(max_workspace_padding_ratio),
+    }
+
+
+def _cost_aware_owner_assignment_name(evaluation: PlannerEvaluation) -> str:
+    if evaluation.name == "matrix_owner_tail_scope_greedy":
+        return "scope_greedy"
+    if evaluation.name == "matrix_owner_tail_role_greedy":
+        return "role_greedy"
+    return evaluation.name
 
 
 def _select_rotation_offset(
@@ -851,6 +1115,9 @@ def _auto_planner_report_row(policy: str, evaluation: PlannerEvaluation, selecte
         total_comm_bytes=resources.total_comm_bytes,
         max_rank_comm_bytes=resources.max_rank_comm_bytes,
         muon_param_imbalance_bytes=resources.muon_param_imbalance_bytes,
+        workspace_preferred_numel=resources.workspace_preferred_numel,
+        workspace_padding_waste_numel=resources.workspace_padding_waste_numel,
+        workspace_padding_waste_ratio=resources.workspace_padding_waste_ratio,
         estimated_padding_units=report.estimated_padding_units,
         estimated_collectives=report.estimated_collectives,
         candidate_padding_units=evaluation.padding_units,

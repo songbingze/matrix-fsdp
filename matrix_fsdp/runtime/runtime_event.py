@@ -36,6 +36,18 @@ class RuntimeEvent:
     collective_numel: int = 0
     collective_bytes: int = 0
     collective_count: int = 0
+    collective_sync_mode: str | None = None
+    collective_phase_timings: dict[str, float] = field(default_factory=dict)
+    grad_bucket_workspace_kind: str | None = None
+    grad_bucket_workspace_numel: int = 0
+    grad_bucket_workspace_padding_waste_numel: int = 0
+    grad_bucket_workspace_persistent: bool = False
+    param_materialization_kind: str | None = None
+    param_materialization_numel: int = 0
+    param_materialization_bytes: int = 0
+    param_materialization_reused: bool = False
+    param_materialization_rank_chunk_fast_path: bool = False
+    param_materialization_packed_full_order: bool = False
 
     @property
     def runtime_unit_id(self) -> RuntimeUnitId:
