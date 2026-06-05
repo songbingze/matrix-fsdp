@@ -1,0 +1,39 @@
+/**/.vscode
+/**/.idea
+/**/__pycache__
+/**/.pytest_cache
+/.venv
+/**/*.pyc
+/**/*.so
+/**/dist
+/**/build
+/**/*.egg-info
+/**/cmake-build-debug
+/**/cmake-build-release
+/**/CMakeLists.txt
+
+# py code style
+/**/.ruff_cache
+
+# tmp files
+benchmark_results/
+/**/*.pt
+/**/*.pt.*
+/**/*.npy
+/**/*.npy.*
+/**/*.tar.gz
+/**/*.json.gz
+/**/*.log
+/**/.DS_Store
+*_checkpoint_dir
+
+# pre-commit config
+./.pre-commit-config.yaml
+
+# claude
+.claude/
+
+# checkpoint
+*.checkpoint_dir
+*.distcp
+.metadata
