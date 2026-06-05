@@ -350,7 +350,19 @@ class ElasticParamBuffer:
         entry = self._persistent_rank_chunk_workspaces.get(lease.key)
         if entry is None or entry["tensor"] is not lease.tensor:
             raise RuntimeError("Attempted to release a persistent elastic workspace that is not owned by this buffer.")
+        if self.workspace.max_cached_per_key == 0:
+            self._persistent_rank_chunk_workspaces.pop(lease.key, None)
+            return
         entry["in_use"] = False
+
+    def clear_idle_persistent_rank_chunk_workspaces(self) -> None:
+        stale_keys = [
+            key
+            for key, entry in self._persistent_rank_chunk_workspaces.items()
+            if not entry["in_use"]
+        ]
+        for key in stale_keys:
+            self._persistent_rank_chunk_workspaces.pop(key, None)
 
     def persistent_workspace_stats(self) -> dict[str, object]:
         allocated_numel = 0

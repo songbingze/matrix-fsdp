@@ -4,7 +4,6 @@ import tempfile
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor.placement_types import Replicate
 from torch import nn
 
 from matrix_fsdp import (
@@ -193,14 +192,16 @@ class OptimizerStateTest(unittest.TestCase):
 
                 metadata = optim.state_manager.local_state_metadata()
                 weight_exp_avg = metadata["weight"]["exp_avg"]
-                self.assertTrue(weight_exp_avg["uses_dtensor"])
+                self.assertFalse(weight_exp_avg["uses_dtensor"])
+                self.assertIsNone(weight_exp_avg["dtensor_spec"])
                 self.assertEqual(weight_exp_avg["device_mesh"]["mesh_dim_names"], ("dp_replicate", "dp_shard"))
                 self.assertEqual(weight_exp_avg["device_mesh"]["shard_mesh_dim_name"], "dp_shard")
                 self.assertEqual(weight_exp_avg["device_mesh"]["replicate_mesh_dim_name"], "dp_replicate")
 
-                state_dtensor = optim.state_dtensors["weight"]["exp_avg"]
-                self.assertIsInstance(state_dtensor._spec.placements[0], Replicate)
-                self.assertEqual(state_dtensor._spec.placements[1], optim.state_objects["weight"]["exp_avg"].placement)
+                self.assertEqual(optim.state_dtensors, {})
+                state_object = optim.state_objects["weight"]["exp_avg"]
+                self.assertIsNone(state_object.dtensor)
+                self.assertTrue(state_object.has_same_data_ptr(state_object.local_tensor))
             finally:
                 dist.destroy_process_group()
 

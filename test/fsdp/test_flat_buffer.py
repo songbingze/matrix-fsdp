@@ -5,7 +5,6 @@ from unittest import mock
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor.placement_types import Replicate
 from torch import nn
 
 from matrix_fsdp.buffer_pool import FullParamBufferPool
@@ -68,7 +67,7 @@ class _FakeEvent:
 
 
 class FlatBufferTest(unittest.TestCase):
-    def test_mesh_sharded_state_exposes_dtensor_wrappers(self):
+    def test_mesh_sharded_state_keeps_local_tensor_and_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             dist.init_process_group("gloo", init_method=f"file://{tmpdir}/init", rank=0, world_size=1)
             try:
@@ -83,36 +82,36 @@ class FlatBufferTest(unittest.TestCase):
                 flat_buffer = MatrixFlatBuffer([_managed_param(param)], plan, rank=0, mesh=mesh)
 
                 self.assertIsInstance(flat_buffer.param_state, MatrixShardedState)
-                self.assertTrue(flat_buffer.param_state.uses_dtensor)
+                self.assertFalse(flat_buffer.param_state.uses_dtensor)
+                self.assertIsNone(flat_buffer.param_state.dtensor)
                 self.assertTrue(flat_buffer.param_state.has_same_data_ptr(flat_buffer.local_shard))
+                self.assertIs(flat_buffer.param_state.fallback_tensor, flat_buffer.local_shard)
                 self.assertEqual(flat_buffer.param_state.mesh_metadata["shape"], (1,))
                 self.assertEqual(flat_buffer.param_state.mesh_metadata["shard_mesh_dim"], 0)
                 self.assertEqual(flat_buffer.param_state.mesh_metadata["shard_mesh_size"], 1)
-                self.assertIsNotNone(flat_buffer.local_shard_dtensor)
-                self.assertIs(flat_buffer.sharded_param, flat_buffer.local_shard_dtensor)
-                self.assertIsNone(flat_buffer._local_shard_fallback)
-                self.assertEqual(flat_buffer.local_shard_dtensor._spec.placements, (flat_buffer.placement,))
-                self.assertEqual(flat_buffer.local_shard_dtensor._spec.shape, torch.Size((6,)))
-                self.assertEqual(flat_buffer.local_shard_dtensor.to_local().data_ptr(), flat_buffer.local_shard.data_ptr())
+                self.assertIsNone(flat_buffer.local_shard_dtensor)
+                self.assertIs(flat_buffer.sharded_param, flat_buffer.param_state)
+                self.assertIs(flat_buffer._local_shard_fallback, flat_buffer.local_shard)
+                self.assertEqual(
+                    flat_buffer.param_state.as_metadata()["matrix_shard"],
+                    {"type": "MatrixShard", "dims": (0,), "local_units": (1,)},
+                )
 
                 local_grad_shard = torch.arange(6, dtype=torch.float32)
                 flat_buffer.use_local_grad_shard(local_grad_shard)
 
                 self.assertIsInstance(flat_buffer.grad_state, MatrixShardedState)
-                self.assertTrue(flat_buffer.grad_state.uses_dtensor)
+                self.assertFalse(flat_buffer.grad_state.uses_dtensor)
+                self.assertIsNone(flat_buffer.grad_state.dtensor)
                 self.assertTrue(flat_buffer.grad_state.has_same_data_ptr(local_grad_shard))
                 self.assertEqual(flat_buffer.grad_state.mesh_metadata, flat_buffer.param_state.mesh_metadata)
-                self.assertIsNotNone(flat_buffer.local_grad_shard_dtensor)
-                self.assertIs(flat_buffer.sharded_grad, flat_buffer.local_grad_shard_dtensor)
-                self.assertIsNone(flat_buffer._local_grad_shard_fallback)
-                self.assertEqual(
-                    flat_buffer.local_grad_shard_dtensor.to_local().data_ptr(),
-                    local_grad_shard.data_ptr(),
-                )
+                self.assertIsNone(flat_buffer.local_grad_shard_dtensor)
+                self.assertIs(flat_buffer.sharded_grad, flat_buffer.grad_state)
+                self.assertIs(flat_buffer._local_grad_shard_fallback, local_grad_shard)
             finally:
                 dist.destroy_process_group()
 
-    def test_2d_mesh_sharded_state_uses_replicate_and_matrix_placements(self):
+    def test_2d_mesh_sharded_state_records_replicate_and_matrix_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             dist.init_process_group("gloo", init_method=f"file://{tmpdir}/init", rank=0, world_size=1)
             try:
@@ -136,16 +135,15 @@ class FlatBufferTest(unittest.TestCase):
                     dp_shard_mesh_dim="dp_shard",
                 )
 
-                self.assertIsNotNone(flat_buffer.local_shard_dtensor)
-                placements = flat_buffer.local_shard_dtensor._spec.placements
-                self.assertIsInstance(placements[0], Replicate)
-                self.assertEqual(placements[1], flat_buffer.placement)
+                self.assertIsNone(flat_buffer.local_shard_dtensor)
+                self.assertIs(flat_buffer.sharded_param, flat_buffer.param_state)
+                self.assertFalse(flat_buffer.param_state.uses_dtensor)
                 self.assertEqual(flat_buffer.param_state.mesh_metadata["mesh_dim_names"], ("dp_replicate", "dp_shard"))
                 self.assertEqual(flat_buffer.param_state.mesh_metadata["shard_mesh_dim_name"], "dp_shard")
                 self.assertEqual(flat_buffer.param_state.mesh_metadata["replicate_mesh_dim_name"], "dp_replicate")
                 self.assertEqual(
-                    flat_buffer.local_shard_dtensor.to_local().data_ptr(),
-                    flat_buffer.local_shard.data_ptr(),
+                    flat_buffer.param_state.as_metadata()["matrix_shard"],
+                    {"type": "MatrixShard", "dims": (0,), "local_units": (1,)},
                 )
             finally:
                 dist.destroy_process_group()
@@ -757,7 +755,7 @@ class FlatBufferTest(unittest.TestCase):
         self.assertTrue(flat_buffer.grad_bucket_input_is_compact)
         self.assertEqual(flat_buffer.grad_bucket_input.numel(), 4)
 
-    def test_owner_copy_in_uses_compact_elastic_workspace(self):
+    def test_owner_copy_in_uses_transient_compact_workspace_by_default(self):
         first = nn.Parameter(torch.arange(3, dtype=torch.float32))
         second = nn.Parameter(torch.arange(10, 11, dtype=torch.float32))
         managed_params = _managed_params(("first", first), ("second", second))
@@ -793,10 +791,45 @@ class FlatBufferTest(unittest.TestCase):
         self.assertEqual(result.stats.workspace_kind, "compact_rank_chunks")
         self.assertEqual(result.stats.workspace_numel, 4)
         self.assertEqual(result.stats.workspace_padding_waste_numel, 0)
-        self.assertTrue(result.stats.workspace_persistent)
+        self.assertFalse(result.stats.workspace_persistent)
         self.assertTrue(captured["compact"])
         self.assertEqual(captured["shard_sizes"], (3, 1))
         torch.testing.assert_close(captured["packed"], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        self.assertEqual(flat_buffer.elastic_param_buffer.workspace.stats()["workspace_acquire_count"], 1)
+        persistent_stats = flat_buffer.elastic_param_buffer.persistent_workspace_stats()
+        self.assertEqual(persistent_stats["persistent_workspace_acquire_count"], 0)
+        self.assertEqual(persistent_stats["persistent_workspace_allocate_count"], 0)
+        self.assertEqual(persistent_stats["persistent_workspace_allocated_numel"], 0)
+        self.assertEqual(persistent_stats["persistent_workspace_in_use_tensors"], 0)
+
+    def test_owner_copy_in_uses_persistent_compact_workspace_when_cache_enabled(self):
+        first = nn.Parameter(torch.arange(3, dtype=torch.float32))
+        second = nn.Parameter(torch.arange(10, 11, dtype=torch.float32))
+        managed_params = _managed_params(("first", first), ("second", second))
+        plan = ShardPlan(
+            total_numel=4,
+            shard_sizes=(3, 1),
+            shard_offsets=(0, 3),
+            rank_segments=(
+                (LayoutSegment(0, 3, 0),),
+                (LayoutSegment(3, 4, 0),),
+            ),
+        )
+        flat_buffer = MatrixFlatBuffer(managed_params, plan, rank=0, matrix_collective_backend="custom")
+        flat_buffer.set_elastic_workspace_cache_limit(1)
+        first.grad = torch.tensor([1.0, 2.0, 3.0])
+        second.grad = torch.tensor([4.0])
+
+        def fake_reduce(packed_rank_chunks, shard_sizes, rank, **kwargs):
+            local_grad_shard = packed_rank_chunks[: shard_sizes[rank]].clone()
+            return MatrixTensorCollectiveHandle(local_grad_shard, lambda: local_grad_shard, _waited=True)
+
+        bucket = flat_buffer.collect_grad_bucket()
+        with mock.patch("matrix_fsdp.runtime.flat_buffer.reduce_scatterv_owner_rank_chunks_1d_async", fake_reduce):
+            result = flat_buffer.start_reduce_grad_bucket_to_local_shard_with_stats(bucket)
+            torch.testing.assert_close(result.handle.wait(), torch.tensor([1.0, 2.0, 3.0]))
+
+        self.assertTrue(result.stats.workspace_persistent)
         self.assertEqual(flat_buffer.elastic_param_buffer.workspace.stats()["workspace_acquire_count"], 0)
         persistent_stats = flat_buffer.elastic_param_buffer.persistent_workspace_stats()
         self.assertEqual(persistent_stats["persistent_workspace_acquire_count"], 1)

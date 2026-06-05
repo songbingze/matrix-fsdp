@@ -186,6 +186,7 @@ class FSDP2MemoryTraceRow:
     local_shard_mb: float = 0.0
     full_grad_buffer_mb: float = 0.0
     grad_bucket_mb: float = 0.0
+    workspace_mb: float = 0.0
     local_grad_shard_mb: float = 0.0
     optimizer_state_mb: float = 0.0
     pending_backward_reduces: int = 0
@@ -773,6 +774,7 @@ def format_memory_trace_table(rows: Sequence[FSDP2MemoryTraceRow]) -> str:
         "local_mb",
         "full_grad_mb",
         "bucket_mb",
+        "workspace_mb",
         "local_grad_mb",
         "opt_state_mb",
         "pending_rs",
@@ -800,6 +802,7 @@ def format_memory_trace_table(rows: Sequence[FSDP2MemoryTraceRow]) -> str:
             f"{row.local_shard_mb:.1f}",
             f"{row.full_grad_buffer_mb:.1f}",
             f"{row.grad_bucket_mb:.1f}",
+            f"{row.workspace_mb:.1f}",
             f"{row.local_grad_shard_mb:.1f}",
             f"{row.optimizer_state_mb:.1f}",
             str(row.pending_backward_reduces),
@@ -2077,6 +2080,7 @@ def _memory_trace_row(
             accounting["local_shard_mb"],
             accounting["full_grad_buffer_mb"],
             accounting["grad_bucket_mb"],
+            accounting["workspace_mb"],
             accounting["local_grad_shard_mb"],
             accounting["optimizer_state_mb"],
             float(accounting["pending_backward_reduces"]),
@@ -2114,9 +2118,10 @@ def _memory_trace_row(
         local_shard_mb=reduced_values[6].item(),
         full_grad_buffer_mb=reduced_values[7].item(),
         grad_bucket_mb=reduced_values[8].item(),
-        local_grad_shard_mb=reduced_values[9].item(),
-        optimizer_state_mb=reduced_values[10].item(),
-        pending_backward_reduces=int(reduced_values[11].item()),
+        workspace_mb=reduced_values[9].item(),
+        local_grad_shard_mb=reduced_values[10].item(),
+        optimizer_state_mb=reduced_values[11].item(),
+        pending_backward_reduces=int(reduced_values[12].item()),
     )
 
 
@@ -2655,6 +2660,7 @@ def _memory_accounting(
         "local_shard_mb": 0.0,
         "full_grad_buffer_mb": 0.0,
         "grad_bucket_mb": 0.0,
+        "workspace_mb": 0.0,
         "local_grad_shard_mb": 0.0,
         "optimizer_state_mb": _bytes_to_mb(_optimizer_state_bytes(optimizer)),
         "pending_backward_reduces": 0,
@@ -2668,6 +2674,7 @@ def _memory_accounting(
     local_shard_bytes = 0
     full_grad_buffer_bytes = 0
     grad_bucket_bytes = 0
+    workspace_bytes = 0
     local_grad_shard_bytes = 0
     for unit in matrix_runtime.runtime_param_groups:
         flat_buffer = getattr(unit, "flat_buffer", None)
@@ -2675,8 +2682,10 @@ def _memory_accounting(
             continue
         full_buffer = getattr(flat_buffer, "full_buffer", None)
         if full_buffer is not None:
-            active_full_param_buffers += 1
-            full_param_buffer_bytes += _tensor_nbytes(full_buffer)
+            full_buffer_bytes = _tensor_nbytes(full_buffer)
+            if full_buffer_bytes > 0:
+                active_full_param_buffers += 1
+                full_param_buffer_bytes += full_buffer_bytes
         local_shard = getattr(flat_buffer, "local_shard", None)
         if local_shard is not None:
             local_shard_bytes += _tensor_nbytes(local_shard)
@@ -2689,6 +2698,7 @@ def _memory_accounting(
         local_grad_shard = getattr(flat_buffer, "local_grad_shard", None)
         if local_grad_shard is not None:
             local_grad_shard_bytes += _tensor_nbytes(local_grad_shard)
+        workspace_bytes += _flat_buffer_workspace_bytes(flat_buffer)
 
     scheduler = _scheduler_from_optimizer(optimizer)
     pending_backward_reduces = getattr(scheduler, "pending_backward_reduce_count", 0) if scheduler is not None else 0
@@ -2699,11 +2709,31 @@ def _memory_accounting(
             "local_shard_mb": _bytes_to_mb(local_shard_bytes),
             "full_grad_buffer_mb": _bytes_to_mb(full_grad_buffer_bytes),
             "grad_bucket_mb": _bytes_to_mb(grad_bucket_bytes),
+            "workspace_mb": _bytes_to_mb(workspace_bytes),
             "local_grad_shard_mb": _bytes_to_mb(local_grad_shard_bytes),
             "pending_backward_reduces": int(pending_backward_reduces),
         }
     )
     return result
+
+
+def _flat_buffer_workspace_bytes(flat_buffer: object) -> int:
+    local_shard = getattr(flat_buffer, "local_shard", None)
+    element_size = local_shard.element_size() if torch.is_tensor(local_shard) else 1
+    total_numel = 0
+    for attr in ("elastic_param_buffer", "static_param_buffer"):
+        param_buffer = getattr(flat_buffer, attr, None)
+        if param_buffer is None:
+            continue
+        workspace = getattr(param_buffer, "workspace", None)
+        if workspace is not None:
+            stats = workspace.stats()
+            total_numel += int(stats.get("workspace_allocated_numel", 0))
+        persistent_stats = getattr(param_buffer, "persistent_workspace_stats", None)
+        if callable(persistent_stats):
+            stats = persistent_stats()
+            total_numel += int(stats.get("persistent_workspace_allocated_numel", 0))
+    return total_numel * int(element_size)
 
 
 def _matrix_runtime_from_optimizer(optimizer: torch.optim.Optimizer | MatrixFSDPOptimizer) -> object | None:
@@ -2760,8 +2790,12 @@ def _tensor_storage_key(tensor: torch.Tensor) -> int:
         return id(tensor)
 
 
-def _tensor_nbytes(tensor: torch.Tensor) -> int:
-    return int(tensor.numel() * tensor.element_size())
+def _tensor_nbytes(tensor: torch.Tensor | None) -> int:
+    if tensor is None:
+        return 0
+    logical_nbytes = int(tensor.numel() * tensor.element_size())
+    storage_nbytes = int(tensor.untyped_storage().nbytes())
+    return min(logical_nbytes, storage_nbytes)
 
 
 def _bytes_to_mb(num_bytes: int) -> float:

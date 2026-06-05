@@ -165,6 +165,7 @@ class FSDP2CompareBenchTest(unittest.TestCase):
                 full_param_buffer_mb=64.0,
                 local_shard_mb=32.0,
                 grad_bucket_mb=16.0,
+                workspace_mb=8.0,
                 optimizer_state_mb=48.0,
                 pending_backward_reduces=1,
             ),
@@ -175,6 +176,7 @@ class FSDP2CompareBenchTest(unittest.TestCase):
         self.assertIn("phase", table)
         self.assertIn("current_mem_mb", table)
         self.assertIn("full_bufs", table)
+        self.assertIn("workspace_mb", table)
         self.assertIn("opt_state_mb", table)
         self.assertIn("adamw", table)
         self.assertIn("after_backward", table)

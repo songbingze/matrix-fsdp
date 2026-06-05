@@ -15,7 +15,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Shard
 from torch.utils.checkpoint import checkpoint
 
 from matrix_fsdp import (
@@ -432,11 +432,13 @@ class MatrixFSDPE2ETest(unittest.TestCase):
                 self.assertEqual(unit.world_size, 1)
                 self.assertEqual(unit.replicate_world_size, 1)
 
-                placements = flat_buffer.local_shard_dtensor._spec.placements
-                self.assertEqual(len(placements), 3)
-                self.assertIsInstance(placements[0], Replicate)
-                self.assertEqual(placements[1], flat_buffer.placement)
-                self.assertIsInstance(placements[2], Replicate)
+                self.assertIsNone(flat_buffer.local_shard_dtensor)
+                self.assertIs(flat_buffer.sharded_param, flat_buffer.param_state)
+                self.assertFalse(flat_buffer.param_state.uses_dtensor)
+                self.assertEqual(
+                    flat_buffer.param_state.as_metadata()["matrix_shard"],
+                    {"type": "MatrixShard", "dims": (0,), "local_units": (1,)},
+                )
             finally:
                 dist.destroy_process_group()
 

@@ -49,9 +49,10 @@ class MatrixFSDPOptimizerStateManager:
     Build MatrixShardedState views for local optimizer tensor state.
 
     Torch optimizers still own ordinary local tensors for mutation. This manager
-    attaches MatrixShard/DTensor metadata to shape-compatible tensor states so
-    validation and checkpointing can reason about optimizer state with the same
-    layout vocabulary as parameters and gradients.
+    attaches MatrixShard metadata to shape-compatible tensor states so validation
+    and checkpointing can reason about optimizer state with the same layout
+    vocabulary as parameters and gradients. DTensor wrappers are intentionally
+    not materialized on the runtime path.
     """
 
     def __init__(self, optimizer: Optimizer, param_groups: list[MatrixFSDPParamGroup]) -> None:

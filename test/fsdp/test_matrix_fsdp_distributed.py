@@ -10,7 +10,7 @@ import torch.multiprocessing as mp
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Shard
 from torch.utils.checkpoint import checkpoint
 
 from matrix_fsdp import (
@@ -356,9 +356,14 @@ def _run_two_rank_step(
         assert flat_buffer.local_numel == plan.shard_sizes[rank]
         assert flat_buffer.local_shard.numel() == plan.shard_sizes[rank]
         if flat_buffer.placement is not None:
-            assert flat_buffer.local_shard_dtensor is not None
-            assert flat_buffer.local_shard_dtensor._spec.placements == (flat_buffer.placement,)
-            assert flat_buffer.local_shard_dtensor.to_local().data_ptr() == flat_buffer.local_shard.data_ptr()
+            assert flat_buffer.local_shard_dtensor is None
+            assert flat_buffer.sharded_param is flat_buffer.param_state
+            assert flat_buffer.param_state.has_same_data_ptr(flat_buffer.local_shard)
+            assert flat_buffer.param_state.as_metadata()["matrix_shard"] == {
+                "type": "MatrixShard",
+                "dims": (0,),
+                "local_units": flat_buffer.placement.local_units,
+            }
         _assert_unit_layout_matches_flat_buffer(unit, rank)
         if use_fsdp2_chunk_plan:
             assert unit.runtime_layout_compatibility.mode == "segment_runtime"
@@ -1326,29 +1331,26 @@ def _run_two_rank_adamw_optimizer_state_step(
         assert summary["tensor_state_numel_by_name"]["exp_avg"] == flat_buffer.local_numel
         assert summary["tensor_state_numel_by_name"]["exp_avg_sq"] == flat_buffer.local_numel
         assert summary["tensor_state_numel"] == 2 * flat_buffer.local_numel
-        assert optimizer.state_dtensors
-        assert optimizer.state_dtensors.keys() == optimizer.local_state_dtensors().keys()
+        assert optimizer.state_dtensors == {}
+        assert optimizer.local_state_dtensors() == {}
         assert optimizer.state_objects
-        state_dtensors = optimizer.state_dtensors
-        assert state_dtensors
-        state_dtensor_numel_by_name = {}
+        state_object_numel_by_name = {}
         managed_params_by_fqn = {mp.fqn: mp for mp in unit.managed_params}
-        for states in state_dtensors.values():
+        for states in optimizer.state_objects.values():
             assert "exp_avg" in states
             assert "exp_avg_sq" in states
-        for fqn, states in state_dtensors.items():
+        for fqn, states in optimizer.state_objects.items():
             expected_placement = flat_buffer.param_matrix_shard(managed_params_by_fqn[fqn])
-            for name, dtensor in states.items():
-                state_object = optimizer.state_objects[fqn][name]
+            for name, state_object in states.items():
                 assert isinstance(state_object, MatrixShardedState)
-                assert state_object.dtensor is dtensor
-                assert state_object.shares_storage_with(dtensor.to_local())
-                assert dtensor._spec.placements == (expected_placement,)
-                state_dtensor_numel_by_name[name] = (
-                    state_dtensor_numel_by_name.get(name, 0) + dtensor.to_local().numel()
+                assert state_object.dtensor is None
+                assert not state_object.uses_dtensor
+                assert state_object.placement == expected_placement
+                state_object_numel_by_name[name] = (
+                    state_object_numel_by_name.get(name, 0) + state_object.local_tensor.numel()
                 )
-        assert state_dtensor_numel_by_name["exp_avg"] == flat_buffer.local_numel
-        assert state_dtensor_numel_by_name["exp_avg_sq"] == flat_buffer.local_numel
+        assert state_object_numel_by_name["exp_avg"] == flat_buffer.local_numel
+        assert state_object_numel_by_name["exp_avg_sq"] == flat_buffer.local_numel
 
         dist.barrier()
     finally:
@@ -1567,9 +1569,11 @@ def _run_two_rank_grad_shard_step(
             unit.finalize_backward()
 
         if flat_buffer.placement is not None:
-            assert flat_buffer.local_grad_shard_dtensor is not None
-            assert flat_buffer.local_grad_shard_dtensor._spec.placements == (flat_buffer.placement,)
-            assert flat_buffer.local_grad_shard_dtensor.to_local().data_ptr() == flat_buffer.local_grad_shard.data_ptr()
+            assert flat_buffer.local_grad_shard_dtensor is None
+            assert flat_buffer.sharded_grad is flat_buffer.grad_state
+            assert flat_buffer.grad_state is not None
+            assert flat_buffer.grad_state.has_same_data_ptr(flat_buffer.local_grad_shard)
+            assert flat_buffer.grad_state.placement == flat_buffer.placement
         actual_local_grad = _flatten_local_grads_by_shard_order(flat_buffer)
         expected_local_grad = _pack_full_tensor_by_segments(averaged_runtime_order_grad, plan.local_segments(rank))
         torch.testing.assert_close(actual_local_grad, expected_local_grad)
@@ -1693,12 +1697,13 @@ def _run_four_rank_cpu_2d_mesh_grad_shard_step(rank: int, world_size: int, init_
         assert unit.replicate_world_size == 2
         _assert_unit_layout_matches_flat_buffer(unit, unit.rank)
 
-        assert flat_buffer.local_shard_dtensor is not None
-        assert flat_buffer.sharded_param is flat_buffer.local_shard_dtensor
-        assert flat_buffer._local_shard_fallback is None
-        placements = flat_buffer.local_shard_dtensor._spec.placements
-        assert isinstance(placements[0], Replicate)
-        assert placements[1] == flat_buffer.placement
+        assert flat_buffer.local_shard_dtensor is None
+        assert flat_buffer.sharded_param is flat_buffer.param_state
+        assert flat_buffer._local_shard_fallback is flat_buffer.local_shard
+        assert flat_buffer.param_state.mesh_metadata["mesh_dim_names"] == ("dp_replicate", "dp_shard")
+        assert flat_buffer.param_state.mesh_metadata["shard_mesh_dim_name"] == "dp_shard"
+        assert flat_buffer.param_state.mesh_metadata["replicate_mesh_dim_name"] == "dp_replicate"
+        assert flat_buffer.param_state.placement == flat_buffer.placement
 
         eager_optim = torch.optim.SGD(eager_model.parameters(), lr=0.1)
         sharded_optim = torch.optim.SGD(sharded_model.parameters(), lr=0.1)
@@ -1718,12 +1723,11 @@ def _run_four_rank_cpu_2d_mesh_grad_shard_step(rank: int, world_size: int, init_
         if unit.lifecycle_state != FSDPLifecycleState.SHARDED:
             unit.finalize_backward()
 
-        assert flat_buffer.local_grad_shard_dtensor is not None
-        assert flat_buffer.sharded_grad is flat_buffer.local_grad_shard_dtensor
-        assert flat_buffer._local_grad_shard_fallback is None
-        grad_placements = flat_buffer.local_grad_shard_dtensor._spec.placements
-        assert isinstance(grad_placements[0], Replicate)
-        assert grad_placements[1] == flat_buffer.placement
+        assert flat_buffer.local_grad_shard_dtensor is None
+        assert flat_buffer.sharded_grad is flat_buffer.grad_state
+        assert flat_buffer.grad_state is not None
+        assert flat_buffer._local_grad_shard_fallback is flat_buffer.local_grad_shard
+        assert flat_buffer.grad_state.placement == flat_buffer.placement
 
         actual_local_grad = _flatten_local_grads_by_shard_order(flat_buffer)
         expected_local_grad = _pack_full_tensor_by_segments(
@@ -1791,13 +1795,12 @@ def _run_four_rank_cpu_3d_mesh_extra_tp_grad_shard_step(rank: int, world_size: i
         assert unit.device_mesh_metadata["replicate_mesh_dim"] == 0
         assert unit.device_mesh_metadata["replicate_mesh_dim_name"] == "dp_replicate"
 
-        assert flat_buffer.local_shard_dtensor is not None
-        assert flat_buffer.sharded_param is flat_buffer.local_shard_dtensor
-        assert flat_buffer._local_shard_fallback is None
-        placements = flat_buffer.local_shard_dtensor._spec.placements
-        assert isinstance(placements[0], Replicate)
-        assert placements[1] == flat_buffer.placement
-        assert isinstance(placements[2], Replicate)
+        assert flat_buffer.local_shard_dtensor is None
+        assert flat_buffer.sharded_param is flat_buffer.param_state
+        assert flat_buffer._local_shard_fallback is flat_buffer.local_shard
+        assert flat_buffer.param_state.mesh_metadata["mesh_dim_names"] == ("dp_replicate", "dp_shard", "tp")
+        assert flat_buffer.param_state.mesh_metadata["shard_mesh_dim_name"] == "dp_shard"
+        assert flat_buffer.param_state.placement == flat_buffer.placement
 
         eager_optim = torch.optim.SGD(eager_model.parameters(), lr=0.1)
         sharded_optim = torch.optim.SGD(sharded_model.parameters(), lr=0.1)
@@ -1817,13 +1820,11 @@ def _run_four_rank_cpu_3d_mesh_extra_tp_grad_shard_step(rank: int, world_size: i
         if unit.lifecycle_state != FSDPLifecycleState.SHARDED:
             unit.finalize_backward()
 
-        assert flat_buffer.local_grad_shard_dtensor is not None
-        assert flat_buffer.sharded_grad is flat_buffer.local_grad_shard_dtensor
-        assert flat_buffer._local_grad_shard_fallback is None
-        grad_placements = flat_buffer.local_grad_shard_dtensor._spec.placements
-        assert isinstance(grad_placements[0], Replicate)
-        assert grad_placements[1] == flat_buffer.placement
-        assert isinstance(grad_placements[2], Replicate)
+        assert flat_buffer.local_grad_shard_dtensor is None
+        assert flat_buffer.sharded_grad is flat_buffer.grad_state
+        assert flat_buffer.grad_state is not None
+        assert flat_buffer._local_grad_shard_fallback is flat_buffer.local_grad_shard
+        assert flat_buffer.grad_state.placement == flat_buffer.placement
 
         actual_local_grad = _flatten_local_grads_by_shard_order(flat_buffer)
         expected_local_grad = _pack_full_tensor_by_segments(

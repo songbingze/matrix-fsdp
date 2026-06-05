@@ -49,7 +49,6 @@ from matrix_fsdp.core.placement import (
 )
 from matrix_fsdp.planning.planner import ShardPlan
 from matrix_fsdp.core.state import MatrixShardedState
-from matrix_fsdp.core.torch_dtensor import make_matrix_dtensor_spec
 
 
 @dataclass
@@ -140,8 +139,7 @@ class MatrixFlatBuffer:
         self.matrix_collective_backend = normalize_matrix_collective_backend(matrix_collective_backend)
         self.param_dtype = param_dtype
         self.collective_key = collective_key
-        self._dtensor_spec_cache: dict[tuple[object, tuple[int, ...], tuple[int, ...], torch.dtype], object] = {}
-
+        self.max_cached_elastic_workspaces_per_key = 0
         self.matrix_shard_compatibility = explain_matrix_shard_compatibility(plan)
         if not self.matrix_shard_compatibility.compatible and not self._can_use_segment_runtime_plan(plan):
             raise ValueError(
@@ -191,11 +189,11 @@ class MatrixFlatBuffer:
 
     @property
     def sharded_param(self):
-        return self.local_shard_dtensor
+        return self.param_state
 
     @property
     def sharded_grad(self):
-        return self.local_grad_shard_dtensor
+        return self.grad_state
 
     @property
     def local_shard_dtensor(self):
@@ -736,7 +734,7 @@ class MatrixFlatBuffer:
                 workspace_lease = self.elastic_param_buffer.acquire_rank_chunk_workspace(
                     self._reduce_reference_tensor(),
                     compact=True,
-                    persistent=True,
+                    persistent=self.max_cached_elastic_workspaces_per_key > 0,
                 )
                 workspace_kind = "compact_rank_chunks"
                 workspace_padding_waste_numel = 0
@@ -938,8 +936,11 @@ class MatrixFlatBuffer:
         self.full_param_buffer_pool = pool
 
     def set_elastic_workspace_cache_limit(self, max_cached_per_key: int) -> None:
+        self.max_cached_elastic_workspaces_per_key = max_cached_per_key
         self.elastic_param_buffer.workspace.set_max_cached_per_key(max_cached_per_key)
         self.static_param_buffer.workspace.set_max_cached_per_key(max_cached_per_key)
+        if max_cached_per_key == 0:
+            self.elastic_param_buffer.clear_idle_persistent_rank_chunk_workspaces()
 
     def _comm_workspace(self) -> CommWorkspaceCache:
         if self._should_use_owner_segment_collectives():
@@ -1404,31 +1405,7 @@ class MatrixFlatBuffer:
             global_stride=global_stride,
             requires_grad=local_tensor.requires_grad,
             shard_mesh_dim=self.dp_shard_mesh_dim,
-            dtensor_spec=self._cached_dtensor_spec(placement, global_shape, global_stride, local_tensor.dtype),
         )
-
-    def _cached_dtensor_spec(
-        self,
-        placement: MatrixShard | None,
-        global_shape: tuple[int, ...],
-        global_stride: tuple[int, ...],
-        dtype: torch.dtype,
-    ):
-        if self.mesh is None or placement is None:
-            return None
-        key = (placement, global_shape, global_stride, dtype)
-        spec = self._dtensor_spec_cache.get(key)
-        if spec is None:
-            spec = make_matrix_dtensor_spec(
-                self.mesh,
-                placement,
-                global_shape=global_shape,
-                global_stride=global_stride,
-                dtype=dtype,
-                shard_mesh_dim=self.dp_shard_mesh_dim,
-            )
-            self._dtensor_spec_cache[key] = spec
-        return spec
 
     def make_param_state(self, mp: ManagedParam, name: str, local_tensor: torch.Tensor) -> MatrixShardedState | None:
         placement = self.param_matrix_shard(mp)
