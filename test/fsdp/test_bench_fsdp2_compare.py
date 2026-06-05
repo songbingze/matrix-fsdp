@@ -65,6 +65,8 @@ class FSDP2CompareBenchTest(unittest.TestCase):
         self.assertIn("matrix_owner_muon_role_greedy_custom_collective_prefetch_cap2", EXPERIMENTAL_MODES)
         self.assertIn("matrix_owner_muon_role_greedy_custom_collective_copy_in", EXPERIMENTAL_MODES)
         self.assertIn("matrix_owner_muon_role_greedy_custom_collective_zero_copy_grad_bucket", EXPERIMENTAL_MODES)
+        self.assertIn("matrix_owner_muon_role_greedy_custom_collective_memory_capped", EXPERIMENTAL_MODES)
+        self.assertIn("matrix_owner_muon_role_greedy_custom_collective_post_reshard", EXPERIMENTAL_MODES)
         self.assertIn("matrix_owner_muon_cost_aware_custom_collective", EXPERIMENTAL_MODES)
         self.assertEqual(DEFAULT_FULLY_SHARD_API_COMPARE_MODES, ("fsdp2_api", "matrix_api"))
 

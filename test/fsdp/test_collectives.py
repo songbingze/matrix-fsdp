@@ -11,6 +11,8 @@ from matrix_fsdp.collectives import (
     reduce_scatterv_owner_rank_chunks_1d_async,
 )
 from matrix_fsdp.runtime.collectives import (
+    MatrixCollectiveHandle,
+    MatrixTensorCollectiveHandle,
     _make_uneven_all_gather_output_list,
     _make_uneven_reduce_scatter_input_list,
     owner_collective_signature_validation_enabled,
@@ -154,6 +156,24 @@ def _run_two_rank_owner_signature_mismatch(rank: int, world_size: int, init_file
 
 @unittest.skipUnless(dist.is_available(), "torch.distributed is not available")
 class MatrixCollectiveBackendTest(unittest.TestCase):
+    def test_collective_handles_release_wait_closure_after_wait(self):
+        result = torch.ones(2)
+        handle = MatrixCollectiveHandle(lambda: result)
+
+        self.assertIs(handle.wait(), result)
+        self.assertIsNone(handle._wait_fn)
+        self.assertIs(handle.wait(), result)
+
+    def test_tensor_collective_handles_release_wait_closure_after_wait(self):
+        initial = torch.zeros(2)
+        result = torch.ones(2)
+        handle = MatrixTensorCollectiveHandle(initial, lambda: result)
+
+        self.assertIs(handle.wait(), result)
+        self.assertIsNone(handle._wait_fn)
+        self.assertTrue(handle._waited)
+        self.assertIs(handle.wait(), result)
+
     def test_owner_collective_signature_validation_is_debug_opt_in(self):
         with unittest.mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(owner_collective_signature_validation_enabled())

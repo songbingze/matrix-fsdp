@@ -25,7 +25,7 @@ _OWNER_COLLECTIVE_SEQUENCE = count()
 
 @dataclass
 class MatrixCollectiveHandle:
-    _wait_fn: Callable[[], torch.Tensor]
+    _wait_fn: Callable[[], torch.Tensor] | None
     _result: torch.Tensor | None = None
     collective_kind: str | None = None
     collective_backend: str | None = None
@@ -44,14 +44,17 @@ class MatrixCollectiveHandle:
 
     def wait(self) -> torch.Tensor:
         if self._result is None:
+            if self._wait_fn is None:
+                raise RuntimeError("MatrixCollectiveHandle has no wait function.")
             self._result = self._wait_fn()
+            self._wait_fn = None
         return self._result
 
 
 @dataclass
 class MatrixTensorCollectiveHandle:
     tensor: torch.Tensor
-    _wait_fn: Callable[[], torch.Tensor]
+    _wait_fn: Callable[[], torch.Tensor] | None
     _waited: bool = False
     collective_kind: str | None = None
     collective_backend: str | None = None
@@ -64,7 +67,10 @@ class MatrixTensorCollectiveHandle:
 
     def wait(self) -> torch.Tensor:
         if not self._waited:
+            if self._wait_fn is None:
+                raise RuntimeError("MatrixTensorCollectiveHandle has no wait function.")
             self.tensor = self._wait_fn()
+            self._wait_fn = None
             self._waited = True
         return self.tensor
 
@@ -642,7 +648,8 @@ def reduce_scatter_uneven_rank_chunks_1d_async(
     input_list = _make_uneven_reduce_scatter_input_list(packed_rank_chunks, shard_sizes)
 
     if cuda_stream is not None:
-        current_stream = torch.cuda.current_stream(packed_rank_chunks.device)
+        _device = packed_rank_chunks.device
+        current_stream = torch.cuda.current_stream(_device)
         cuda_stream.wait_stream(current_stream)
         with torch.cuda.stream(cuda_stream):
             dist.reduce_scatter(local_grad_shard, input_list, op=dist.ReduceOp.SUM, group=group, async_op=False)
@@ -652,7 +659,7 @@ def reduce_scatter_uneven_rank_chunks_1d_async(
             event.record(cuda_stream)
 
         def wait() -> torch.Tensor:
-            torch.cuda.current_stream(packed_rank_chunks.device).wait_event(event)
+            torch.cuda.current_stream(_device).wait_event(event)
             return local_grad_shard
 
         return MatrixTensorCollectiveHandle(local_grad_shard, wait, collective_sync_mode="cuda_event")
@@ -706,7 +713,8 @@ def reduce_owner_rank_chunks_1d_async(
         return packed_rank_chunks[start : start + shard_sizes[owner_rank]]
 
     if cuda_stream is not None:
-        current_stream = torch.cuda.current_stream(packed_rank_chunks.device)
+        _device = packed_rank_chunks.device
+        current_stream = torch.cuda.current_stream(_device)
         cuda_stream.wait_stream(current_stream)
         with torch.cuda.stream(cuda_stream):
             for owner_rank, size in enumerate(shard_sizes):
@@ -720,7 +728,7 @@ def reduce_owner_rank_chunks_1d_async(
             event.record(cuda_stream)
 
         def wait() -> torch.Tensor:
-            torch.cuda.current_stream(packed_rank_chunks.device).wait_event(event)
+            torch.cuda.current_stream(_device).wait_event(event)
             return local_grad_shard
 
         return MatrixTensorCollectiveHandle(local_grad_shard, wait, collective_sync_mode="cuda_event")
@@ -952,7 +960,8 @@ def reduce_scatter_padded_rank_chunks_1d_async(
     local_tensor = output if local_size == padded_local_size else output[:local_size]
 
     if cuda_stream is not None:
-        current_stream = torch.cuda.current_stream(packed_rank_chunks.device)
+        _device = packed_rank_chunks.device
+        current_stream = torch.cuda.current_stream(_device)
         cuda_stream.wait_stream(current_stream)
         with torch.cuda.stream(cuda_stream):
             # Match FSDP2's scheduling: enqueue the collective on the dedicated
@@ -965,7 +974,7 @@ def reduce_scatter_padded_rank_chunks_1d_async(
             event.record(cuda_stream)
 
         def wait() -> torch.Tensor:
-            torch.cuda.current_stream(packed_rank_chunks.device).wait_event(event)
+            torch.cuda.current_stream(_device).wait_event(event)
             return local_tensor
 
         return MatrixTensorCollectiveHandle(local_tensor, wait, collective_sync_mode="cuda_event")

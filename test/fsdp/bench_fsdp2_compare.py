@@ -101,7 +101,9 @@ EXPERIMENTAL_MODES = (
     "matrix_owner_muon_role_greedy_custom_collective_prefetch_cap2",
     "matrix_owner_muon_role_greedy_custom_collective_copy_in",
     "matrix_owner_muon_role_greedy_custom_collective_zero_copy_grad_bucket",
+    "matrix_owner_muon_role_greedy_custom_collective_memory_capped",
     "matrix_owner_muon_role_greedy_custom_collective_pre_backward",
+    "matrix_owner_muon_role_greedy_custom_collective_post_reshard",
     "matrix_owner_muon_scope_greedy_custom_collective",
     "matrix_owner_muon_scope_greedy_custom_collective_pre_backward",
     "matrix_owner_muon_cost_aware_custom_collective",
@@ -1218,9 +1220,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "matrix_owner_muon_role_greedy_matrix_all_gather",
             "matrix_owner_muon_role_greedy_matrix_all_gather_pre_backward",
             "matrix_owner_muon_role_greedy_custom_collective",
+            "matrix_owner_muon_role_greedy_custom_collective_prefetch_cap2",
             "matrix_owner_muon_role_greedy_custom_collective_copy_in",
             "matrix_owner_muon_role_greedy_custom_collective_zero_copy_grad_bucket",
+            "matrix_owner_muon_role_greedy_custom_collective_memory_capped",
             "matrix_owner_muon_role_greedy_custom_collective_pre_backward",
+            "matrix_owner_muon_role_greedy_custom_collective_post_reshard",
             "matrix_owner_muon_scope_greedy_custom_collective",
             "matrix_owner_muon_scope_greedy_custom_collective_pre_backward",
             "matrix_owner_muon_cost_aware_custom_collective",
@@ -2422,6 +2427,19 @@ def _prepare_mode(
             matrix_collective_backend="custom",
             use_zero_copy_grad_bucket=True,
         )
+    if mode == "matrix_owner_muon_role_greedy_custom_collective_memory_capped":
+        return _prepare_matrix_owner_muon(
+            model,
+            mesh,
+            config,
+            owner_assignment="role_greedy",
+            matrix_collective_backend="custom",
+            use_zero_copy_grad_bucket=True,
+            max_unsharded_prefetch_units=0,
+            max_backward_prefetch_units=0,
+            max_active_full_param_buffers=1,
+            max_pending_backward_reduces=0,
+        )
     if mode == "matrix_owner_muon_role_greedy_custom_collective_pre_backward":
         return _prepare_matrix_owner_muon(
             model,
@@ -2429,6 +2447,15 @@ def _prepare_mode(
             config,
             owner_assignment="role_greedy",
             backward_prefetch_timing="pre_backward",
+            matrix_collective_backend="custom",
+        )
+    if mode == "matrix_owner_muon_role_greedy_custom_collective_post_reshard":
+        return _prepare_matrix_owner_muon(
+            model,
+            mesh,
+            config,
+            owner_assignment="role_greedy",
+            backward_prefetch_timing="post_reshard",
             matrix_collective_backend="custom",
         )
     if mode == "matrix_owner_muon_scope_greedy_custom_collective":
@@ -2532,13 +2559,14 @@ def _prepare_matrix_owner_muon(
     config: FSDP2CompareConfig,
     *,
     owner_assignment: str = "rotate",
-    backward_prefetch_timing: str = "post_reshard",
+    backward_prefetch_timing: str = "pre_backward",
     param_gather_strategy: str = "auto",
     matrix_collective_backend: str = "owner_broadcast",
     use_zero_copy_grad_bucket: bool = False,
     max_unsharded_prefetch_units: int | None = 1,
     max_backward_prefetch_units: int | None = None,
     max_active_full_param_buffers: int | None = None,
+    max_pending_backward_reduces: int | None = 1,
 ) -> tuple[nn.Module, MatrixFSDPOptimizer]:
     if config.optimizer != "muon":
         raise ValueError("matrix_owner_muon modes require --optimizer muon.")
@@ -2575,6 +2603,7 @@ def _prepare_matrix_owner_muon(
         max_backward_prefetch_units=max_backward_prefetch_units,
         backward_prefetch_timing=backward_prefetch_timing,  # type: ignore[arg-type]
         max_active_full_param_buffers=max_active_full_param_buffers,
+        max_pending_backward_reduces=max_pending_backward_reduces,
         max_cached_elastic_workspaces_per_key=config.matrix_max_cached_elastic_workspaces_per_key,
     )
     return sharded_model, optimizer
