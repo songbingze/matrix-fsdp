@@ -8,6 +8,7 @@ import os
 import socket
 import tempfile
 import time
+from functools import partial
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -16,6 +17,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointImpl,
+    apply_activation_checkpointing,
+    checkpoint_wrapper,
+)
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
 
@@ -50,6 +56,9 @@ class RuntimeProfileConfig:
     warmup_steps: int = 1
     profile_steps: int = 2
     profile_memory_limit_mb: float = 0.0
+    activation_checkpoint: bool = False
+    activation_checkpoint_wrapper: bool = False
+    checkpoint_use_reentrant: bool = False
     max_active_full_param_buffers: int | None = None
     max_active_full_param_numel: int | None = None
     max_active_full_param_memory_mb: float = 0.0
@@ -232,6 +241,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--profile-steps", type=int, default=2)
     parser.add_argument("--profile-memory-limit-mb", type=float, default=0.0)
+    parser.add_argument("--activation-checkpoint", action="store_true")
+    parser.add_argument(
+        "--activation-checkpoint-wrapper",
+        action="store_true",
+        help="Apply activation checkpointing with torch checkpoint_wrapper.",
+    )
+    parser.add_argument("--checkpoint-use-reentrant", action="store_true")
     parser.add_argument("--max-active-full-param-buffers", type=int, default=None)
     parser.add_argument("--max-active-full-param-numel", type=int, default=None)
     parser.add_argument("--max-active-full-param-memory-mb", type=float, default=0.0)
@@ -257,6 +273,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         warmup_steps=args.warmup_steps,
         profile_steps=args.profile_steps,
         profile_memory_limit_mb=args.profile_memory_limit_mb,
+        activation_checkpoint=args.activation_checkpoint,
+        activation_checkpoint_wrapper=args.activation_checkpoint_wrapper,
+        checkpoint_use_reentrant=args.checkpoint_use_reentrant,
         max_active_full_param_buffers=args.max_active_full_param_buffers,
         max_active_full_param_numel=args.max_active_full_param_numel,
         max_active_full_param_memory_mb=args.max_active_full_param_memory_mb,
@@ -399,7 +418,11 @@ def _prepare_matrix_owner_muon(
         raise ValueError("matrix_owner_muon modes require --optimizer muon.")
     owner_assignment = "role_greedy" if "role_greedy" in config.mode else "rotate"
     matrix_collective_backend = "custom" if "custom_collective" in config.mode else "owner_broadcast"
-    use_zero_copy_grad_bucket = config.mode.endswith("_zero_copy_grad_bucket")
+    use_zero_copy_grad_bucket = config.mode.endswith("_zero_copy_grad_bucket") or (
+        matrix_collective_backend == "custom"
+        and not config.mode.endswith("_copy_in")
+        and _use_auto_muon_owner_zero_copy_grad_bucket(config)
+    )
     owner_backward_prefetch_with_pending_reduce = "on" if matrix_collective_backend == "custom" else "auto"
     sharded_model = matrix_fully_shard(
         model,
@@ -426,6 +449,10 @@ def _prepare_matrix_owner_muon(
         owner_backward_prefetch_with_pending_reduce=owner_backward_prefetch_with_pending_reduce,
     )
     return sharded_model, optimizer
+
+
+def _use_auto_muon_owner_zero_copy_grad_bucket(config: RuntimeProfileConfig) -> bool:
+    return config.seq_len >= 8192
 
 
 def _profile_prefetch_budget_if_needed(
@@ -526,18 +553,44 @@ def _make_optimizer(params, config: RuntimeProfileConfig) -> torch.optim.Optimiz
 
 def _make_model(config: RuntimeProfileConfig) -> nn.Module:
     if config.model == "mlp":
-        return MLPStack(config.layers, config.hidden, config.intermediate)
-    if config.model == "transformer":
-        return TransformerStack(TransformerBlock, config.layers, config.hidden, config.intermediate, config.heads)
-    if config.model == "transformer_split_qkv":
-        return TransformerStack(
+        model = MLPStack(config.layers, config.hidden, config.intermediate)
+    elif config.model == "transformer":
+        model = TransformerStack(TransformerBlock, config.layers, config.hidden, config.intermediate, config.heads)
+    elif config.model == "transformer_split_qkv":
+        model = TransformerStack(
             SplitQKVTransformerBlock,
             config.layers,
             config.hidden,
             config.intermediate,
             config.heads,
         )
-    raise ValueError(f"Unknown model: {config.model}.")
+    else:
+        raise ValueError(f"Unknown model: {config.model}.")
+    if config.activation_checkpoint and config.activation_checkpoint_wrapper:
+        _apply_checkpoint_wrapper(model, config)
+    return model
+
+
+def _apply_checkpoint_wrapper(model: nn.Module, config: RuntimeProfileConfig) -> None:
+    checkpoint_impl = CheckpointImpl.REENTRANT if config.checkpoint_use_reentrant else CheckpointImpl.NO_REENTRANT
+    wrapper = partial(checkpoint_wrapper, checkpoint_impl=checkpoint_impl)
+    apply_activation_checkpointing(
+        model,
+        checkpoint_wrapper_fn=wrapper,
+        check_fn=_activation_checkpoint_check_fn(config),
+    )
+
+
+def _activation_checkpoint_check_fn(config: RuntimeProfileConfig):
+    if config.model == "mlp":
+        target_types = (MLPBlock,)
+    elif config.model == "transformer":
+        target_types = (TransformerBlock,)
+    elif config.model == "transformer_split_qkv":
+        target_types = (SplitQKVTransformerBlock,)
+    else:
+        raise ValueError(f"Unknown model: {config.model}.")
+    return lambda module: isinstance(module, target_types)
 
 
 def _make_mesh(config: RuntimeProfileConfig) -> DeviceMesh | None:
@@ -582,6 +635,8 @@ def _validate_config(config: RuntimeProfileConfig) -> None:
         raise ValueError(f"profile_steps must be non-negative, got {config.profile_steps}.")
     if config.profile_memory_limit_mb < 0:
         raise ValueError(f"profile_memory_limit_mb must be non-negative, got {config.profile_memory_limit_mb}.")
+    if config.activation_checkpoint_wrapper and not config.activation_checkpoint:
+        raise ValueError("activation_checkpoint_wrapper requires activation_checkpoint.")
     if config.max_active_full_param_buffers is not None and config.max_active_full_param_buffers <= 0:
         raise ValueError("max_active_full_param_buffers must be positive.")
     if config.max_active_full_param_numel is not None and config.max_active_full_param_numel <= 0:

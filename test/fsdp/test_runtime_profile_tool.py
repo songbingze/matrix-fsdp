@@ -101,6 +101,31 @@ class RuntimeProfileToolTest(unittest.TestCase):
         self.assertIn("prepare_grad_bucket_zero_copy", event_names)
         self.assertGreater(result["runtime_summary"]["schedulers"][0]["max_grad_bucket_bytes"], 0)
 
+    def test_checkpoint_wrapper_profile_uses_checkpointed_blocks(self):
+        result = run_profile(
+            RuntimeProfileConfig(
+                model="transformer_split_qkv",
+                mode="prefetch_bucket_copy_in",
+                layers=1,
+                hidden=16,
+                intermediate=32,
+                heads=4,
+                seq_len=8,
+                batch_size=2,
+                activation_checkpoint=True,
+                activation_checkpoint_wrapper=True,
+                warmup_steps=0,
+                profile_steps=0,
+                steps=1,
+            )
+        )
+
+        event_names = [event["name"] for event in result["runtime_summary"]["events"]]
+
+        self.assertTrue(result["config"]["activation_checkpoint"])
+        self.assertTrue(result["config"]["activation_checkpoint_wrapper"])
+        self.assertIn("checkpoint_recompute_pre_forward", event_names)
+
     @unittest.skipUnless(hasattr(torch.optim, "Muon"), "requires torch.optim.Muon")
     def test_matrix_owner_muon_profile_reports_split_qkv_memory_events(self):
         result = run_profile(
