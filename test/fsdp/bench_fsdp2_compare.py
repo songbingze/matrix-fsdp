@@ -2397,7 +2397,6 @@ def _prepare_mode(
             config,
             owner_assignment="role_greedy",
             matrix_collective_backend="custom",
-            use_zero_copy_grad_bucket=_use_auto_muon_owner_zero_copy_grad_bucket(config),
         )
     if mode == "matrix_owner_muon_role_greedy_custom_collective_prefetch_cap2":
         return _prepare_matrix_owner_muon(
@@ -2612,13 +2611,6 @@ def _prepare_matrix_owner_muon(
         max_cached_elastic_workspaces_per_key=config.matrix_max_cached_elastic_workspaces_per_key,
     )
     return sharded_model, optimizer
-
-
-def _use_auto_muon_owner_zero_copy_grad_bucket(config: FSDP2CompareConfig) -> bool:
-    # Long-sequence Muon owner layouts spend measurable time packing gradients
-    # into compact owner chunks. Keep short-sequence benchmarks on the faster
-    # copy-in path, where the extra zero-copy bookkeeping does not amortize.
-    return config.seq_len >= 8192
 
 
 def _apply_fsdp2(model: nn.Module, mesh: DeviceMesh, config: FSDP2CompareConfig, *, shard_root: bool) -> None:

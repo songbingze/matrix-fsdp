@@ -418,11 +418,7 @@ def _prepare_matrix_owner_muon(
         raise ValueError("matrix_owner_muon modes require --optimizer muon.")
     owner_assignment = "role_greedy" if "role_greedy" in config.mode else "rotate"
     matrix_collective_backend = "custom" if "custom_collective" in config.mode else "owner_broadcast"
-    use_zero_copy_grad_bucket = config.mode.endswith("_zero_copy_grad_bucket") or (
-        matrix_collective_backend == "custom"
-        and not config.mode.endswith("_copy_in")
-        and _use_auto_muon_owner_zero_copy_grad_bucket(config)
-    )
+    use_zero_copy_grad_bucket = config.mode.endswith("_zero_copy_grad_bucket")
     owner_backward_prefetch_with_pending_reduce = "on" if matrix_collective_backend == "custom" else "auto"
     sharded_model = matrix_fully_shard(
         model,
@@ -449,10 +445,6 @@ def _prepare_matrix_owner_muon(
         owner_backward_prefetch_with_pending_reduce=owner_backward_prefetch_with_pending_reduce,
     )
     return sharded_model, optimizer
-
-
-def _use_auto_muon_owner_zero_copy_grad_bucket(config: RuntimeProfileConfig) -> bool:
-    return config.seq_len >= 8192
 
 
 def _profile_prefetch_budget_if_needed(

@@ -36,7 +36,6 @@ from test.fsdp.bench_fsdp2_compare import (
     _muon_params,
     _prefetch_budget,
     _is_unit,
-    _use_auto_muon_owner_zero_copy_grad_bucket,
 )
 from matrix_fsdp import MatrixFSDPOptimizer, make_muon_shard_aware_group_planner, matrix_fully_shard
 from scripts.run_isolated_gpu_benchmark import (
@@ -70,13 +69,6 @@ class FSDP2CompareBenchTest(unittest.TestCase):
         self.assertIn("matrix_owner_muon_role_greedy_custom_collective_post_reshard", EXPERIMENTAL_MODES)
         self.assertIn("matrix_owner_muon_cost_aware_custom_collective", EXPERIMENTAL_MODES)
         self.assertEqual(DEFAULT_FULLY_SHARD_API_COMPARE_MODES, ("fsdp2_api", "matrix_api"))
-
-    def test_muon_owner_auto_grad_bucket_selects_zero_copy_for_long_sequence(self):
-        short_config = FSDP2CompareConfig(seq_len=4096)
-        long_config = FSDP2CompareConfig(seq_len=8192)
-
-        self.assertFalse(_use_auto_muon_owner_zero_copy_grad_bucket(short_config))
-        self.assertTrue(_use_auto_muon_owner_zero_copy_grad_bucket(long_config))
 
     def test_block_group_size_wraps_adjacent_benchmark_blocks(self):
         config = FSDP2CompareConfig(
