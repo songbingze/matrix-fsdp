@@ -14,6 +14,7 @@ from matrix_fsdp.runtime.param_group import MatrixFSDPParamGroup
 PrefetchPolicy = Literal["static", "adaptive", "profile_guided"]
 BackwardPrefetchTiming = Literal["pre_backward", "post_reshard"]
 DEFAULT_MAX_UNSHARDED_PREFETCH_UNITS = 1
+_CURRENT_GRAPH_TASK_ID = getattr(torch._C, "_current_graph_task_id", None)
 
 
 @dataclass(frozen=True)
@@ -1084,8 +1085,7 @@ class MatrixFSDPScheduler:
 
 
 def _is_in_backward_graph_task() -> bool:
-    current_graph_task_id = getattr(torch._C, "_current_graph_task_id", None)
-    return current_graph_task_id is not None and current_graph_task_id() != -1
+    return _CURRENT_GRAPH_TASK_ID is not None and _CURRENT_GRAPH_TASK_ID() != -1
 
 
 def _tensor_nbytes(tensor: torch.Tensor | None) -> int:

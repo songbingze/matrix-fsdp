@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -13,6 +13,7 @@ class ForwardBackwardContext:
     callback: PreBackwardCallback
     registered_hooks: int = 0
     pre_backward_called: bool = False
+    _hook: Callable[[torch.Tensor], torch.Tensor] | None = field(default=None, init=False, repr=False)
 
     @property
     def pending_backward(self) -> bool:
@@ -26,6 +27,11 @@ class ForwardBackwardContext:
             return
         self.pre_backward_called = True
         self.callback()
+
+    def hook(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        if self._hook is None:
+            self._hook = _make_pre_backward_hook(self)
+        return self._hook
 
 
 def register_pre_backward_hooks(output: object, callback: PreBackwardCallback) -> int:
@@ -51,7 +57,7 @@ def register_pre_backward_hooks_with_context(output: object, context: ForwardBac
     if isinstance(output, torch.Tensor):
         if not output.requires_grad:
             return 0
-        output.register_hook(_make_pre_backward_hook(context))
+        output.register_hook(context.hook())
         return 1
     if isinstance(output, Mapping):
         return sum(register_pre_backward_hooks_with_context(value, context) for value in output.values())

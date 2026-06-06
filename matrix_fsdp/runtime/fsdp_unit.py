@@ -46,11 +46,11 @@ if TYPE_CHECKING:
 LayoutPlanner = GroupPlanner
 RuntimeLayoutPolicy = str
 _RUNTIME_LAYOUT_POLICIES = ("auto", "no_reorder", "matrix_shard_only")
+_CURRENT_GRAPH_TASK_ID = getattr(torch._C, "_current_graph_task_id", None)
 
 
 def _is_in_backward_graph_task() -> bool:
-    current_graph_task_id = getattr(torch._C, "_current_graph_task_id", None)
-    return current_graph_task_id is not None and current_graph_task_id() != -1
+    return _CURRENT_GRAPH_TASK_ID is not None and _CURRENT_GRAPH_TASK_ID() != -1
 
 
 @dataclass(frozen=True)
@@ -1028,6 +1028,7 @@ class MatrixFSDPParamGroup:
         kwargs: dict[str, object],
     ) -> tuple[tuple[object, ...], dict[str, object]]:
         trace = self.runtime_trace_enabled
+        grad_enabled = torch.is_grad_enabled()
         pre_forward_start = perf_counter() if trace else None
         in_backward_graph_task = _is_in_backward_graph_task()
         if not in_backward_graph_task and self._checkpoint_recompute_forward_depth > 0:
@@ -1093,7 +1094,7 @@ class MatrixFSDPParamGroup:
                 "pre_forward_prefetch_next_runtime",
                 duration_ms=(perf_counter() - prefetch_start) * 1000.0,
             )
-        if torch.is_grad_enabled() and not self.reshard_after_forward_enabled:
+        if grad_enabled and not self.reshard_after_forward_enabled:
             prepare_start = perf_counter() if trace else None
             self._prepare_backward_grad_storage()
             if trace:
@@ -1101,8 +1102,11 @@ class MatrixFSDPParamGroup:
                     "pre_forward_prepare_backward_grad_storage_runtime",
                     duration_ms=(perf_counter() - prepare_start) * 1000.0,
                 )
-        if self.reshard_after_forward_enabled and torch.is_grad_enabled():
-            self._active_backward_context = ForwardBackwardContext(self._pre_backward_unshard)
+        if self.reshard_after_forward_enabled and grad_enabled:
+            if self.use_saved_tensor_hooks:
+                self._active_backward_context = ForwardBackwardContext(self._pre_backward_unshard)
+            else:
+                self._active_backward_context = None
             if self.use_saved_tensor_hooks:
                 hook_start = perf_counter() if trace else None
                 self._enter_saved_tensors_hooks()
@@ -1129,12 +1133,14 @@ class MatrixFSDPParamGroup:
         output: object,
     ) -> object:
         trace = self.runtime_trace_enabled
+        grad_enabled = torch.is_grad_enabled()
         post_forward_start = perf_counter() if trace else None
         if self._checkpoint_recompute_forward_depth > 0 and _is_in_backward_graph_task():
             self._checkpoint_recompute_forward_depth -= 1
             if trace:
                 self._record_event("checkpoint_recompute_post_forward")
-            output = self._cast_forward_output(output)
+            if self.output_dtype is not None:
+                output = self._cast_forward_output(output)
             if trace:
                 self._record_event("post_forward_runtime", duration_ms=(perf_counter() - post_forward_start) * 1000.0)
             return output
@@ -1143,20 +1149,32 @@ class MatrixFSDPParamGroup:
             if trace:
                 self._record_event("checkpoint_recompute_depth_reset")
         if not self.reshard_after_forward_enabled:
-            output = self._cast_forward_output(output)
+            if self.output_dtype is not None:
+                output = self._cast_forward_output(output)
             if trace:
                 self._record_event("post_forward_runtime", duration_ms=(perf_counter() - post_forward_start) * 1000.0)
             return output
-        saved_hooks_start = perf_counter() if trace else None
-        self._exit_saved_tensors_hooks()
-        if trace:
-            self._record_event("exit_saved_tensors_hooks", duration_ms=(perf_counter() - saved_hooks_start) * 1000.0)
+        if self._saved_tensors_hooks_context is not None:
+            saved_hooks_start = perf_counter() if trace else None
+            self._exit_saved_tensors_hooks()
+            if trace:
+                self._record_event(
+                    "exit_saved_tensors_hooks",
+                    duration_ms=(perf_counter() - saved_hooks_start) * 1000.0,
+                )
         context = self._active_backward_context
-        if torch.is_grad_enabled():
+        if grad_enabled:
             if context is None:
                 context = ForwardBackwardContext(self._pre_backward_unshard)
             hook_start = perf_counter() if trace else None
-            registered_hooks = register_pre_backward_hooks_with_context(output, context)
+            if isinstance(output, torch.Tensor):
+                if output.requires_grad:
+                    output.register_hook(context.hook())
+                    registered_hooks = 1
+                else:
+                    registered_hooks = 0
+            else:
+                registered_hooks = register_pre_backward_hooks_with_context(output, context)
             if trace:
                 self._record_event("register_pre_backward_hooks", duration_ms=(perf_counter() - hook_start) * 1000.0)
             context.mark_registered(registered_hooks)
@@ -1167,7 +1185,8 @@ class MatrixFSDPParamGroup:
         self.reshard_after_forward(needs_pre_backward_unshard=registered_hooks > 0)
         if registered_hooks > 0 and self._scheduler is not None:
             self._scheduler.record_post_forward(self)
-        output = self._cast_forward_output(output)
+        if self.output_dtype is not None:
+            output = self._cast_forward_output(output)
         if trace:
             self._record_event("post_forward_runtime", duration_ms=(perf_counter() - post_forward_start) * 1000.0)
         return output
@@ -1233,6 +1252,9 @@ class MatrixFSDPParamGroup:
     def _prepare_full_grad_buffer(self) -> None:
         if self.flat_buffer is None:
             return
+        if not self.runtime_trace_enabled:
+            self.flat_buffer.prepare_full_grad_buffer(accumulate=self._defer_backward_reduce)
+            return
         prepare_start = self._trace_start()
         reused = self.flat_buffer.prepare_full_grad_buffer(accumulate=self._defer_backward_reduce)
         if reused:
@@ -1246,6 +1268,9 @@ class MatrixFSDPParamGroup:
     def _prepare_local_grad_accumulator(self) -> None:
         if self.flat_buffer is None:
             return
+        if not self.runtime_trace_enabled:
+            self.flat_buffer.prepare_local_grad_accumulator()
+            return
         prepare_start = self._trace_start()
         self.flat_buffer.prepare_local_grad_accumulator()
         self._record_event("prepare_local_grad_accumulator", duration_ms=self._trace_duration_ms(prepare_start))
@@ -1254,6 +1279,12 @@ class MatrixFSDPParamGroup:
         if self.flat_buffer is None:
             return
         had_accumulated_bucket = self._defer_backward_reduce and self.flat_buffer.grad_bucket_input is not None
+        if not self.runtime_trace_enabled:
+            self._grad_bucket_prepared_zero_copy = self.flat_buffer.prepare_grad_bucket(
+                zero_copy=self.use_zero_copy_grad_bucket,
+                accumulate=self._defer_backward_reduce,
+            )
+            return
         prepare_start = self._trace_start()
         zero_copy = self.flat_buffer.prepare_grad_bucket(
             zero_copy=self.use_zero_copy_grad_bucket,
@@ -1277,6 +1308,9 @@ class MatrixFSDPParamGroup:
             or not self._defer_backward_reduce
         ):
             return
+        if not self.runtime_trace_enabled:
+            self.flat_buffer.accumulate_grad_bucket_input_from_param_grads()
+            return
         copy_start = self._trace_start()
         accumulated = self.flat_buffer.accumulate_grad_bucket_input_from_param_grads()
         self._record_event("copy_in_grad_bucket_for_accumulation", duration_ms=self._trace_duration_ms(copy_start))
@@ -1291,6 +1325,13 @@ class MatrixFSDPParamGroup:
     def _enter_saved_tensors_hooks(self) -> None:
         if self._saved_tensors_hooks_context is not None:
             raise RuntimeError("Saved tensor hooks are already active for this MatrixFSDP param group.")
+        if not self.runtime_trace_enabled:
+            self._saved_tensors_hooks_context = torch.autograd.graph.saved_tensors_hooks(
+                self._pack_saved_tensor,
+                self._unpack_saved_tensor,
+            )
+            self._saved_tensors_hooks_context.__enter__()
+            return
         hook_start = self._trace_start()
         self._saved_tensors_hooks_context = torch.autograd.graph.saved_tensors_hooks(
             self._pack_saved_tensor,
@@ -1301,6 +1342,10 @@ class MatrixFSDPParamGroup:
 
     def _exit_saved_tensors_hooks(self) -> None:
         if self._saved_tensors_hooks_context is None:
+            return
+        if not self.runtime_trace_enabled:
+            self._saved_tensors_hooks_context.__exit__(None, None, None)
+            self._saved_tensors_hooks_context = None
             return
         hook_start = self._trace_start()
         self._saved_tensors_hooks_context.__exit__(None, None, None)
@@ -1398,6 +1443,12 @@ class MatrixFSDPParamGroup:
             return
         managed_param = self._post_backward_param_by_id.get(id(param))
         if managed_param is None:
+            return
+        if not self.runtime_trace_enabled:
+            if self.backward_reduce_strategy == "per_param_allreduce":
+                self.flat_buffer.all_reduce_param_grad_to_local_accumulator(managed_param)
+            else:
+                self.flat_buffer.reduce_param_grad_to_local_accumulator(managed_param)
             return
         reduce_start = self._trace_start()
         if self.backward_reduce_strategy == "per_param_allreduce":
