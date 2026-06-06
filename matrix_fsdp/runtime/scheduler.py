@@ -13,6 +13,7 @@ from matrix_fsdp.runtime.param_group import MatrixFSDPParamGroup
 
 PrefetchPolicy = Literal["static", "adaptive", "profile_guided"]
 BackwardPrefetchTiming = Literal["pre_backward", "post_reshard"]
+OwnerBackwardPrefetchWithPendingReduce = Literal["auto", "on", "off"]
 DEFAULT_MAX_UNSHARDED_PREFETCH_UNITS = 1
 _CURRENT_GRAPH_TASK_ID = getattr(torch._C, "_current_graph_task_id", None)
 
@@ -37,6 +38,7 @@ class MatrixFSDPSchedulerConfig:
     max_active_full_param_numel: int | None = None
     max_active_full_param_memory_mb: float | None = None
     max_pending_backward_reduces: int | None = 1
+    owner_backward_prefetch_with_pending_reduce: OwnerBackwardPrefetchWithPendingReduce = "auto"
     trim_cuda_cache: bool = False
     cuda_cache_trim_threshold_mb: float = 1024.0
 
@@ -53,6 +55,7 @@ class MatrixFSDPSchedulerConfig:
             "max_active_full_param_numel": self.max_active_full_param_numel,
             "max_active_full_param_memory_mb": self.max_active_full_param_memory_mb,
             "max_pending_backward_reduces": self.max_pending_backward_reduces,
+            "owner_backward_prefetch_with_pending_reduce": self.owner_backward_prefetch_with_pending_reduce,
             "trim_cuda_cache": self.trim_cuda_cache,
             "cuda_cache_trim_threshold_mb": self.cuda_cache_trim_threshold_mb,
         }
@@ -98,6 +101,7 @@ class MatrixFSDPScheduler:
         max_active_full_param_numel: int | None = None,
         max_active_full_param_memory_mb: float | None = None,
         max_pending_backward_reduces: int | None = 1,
+        owner_backward_prefetch_with_pending_reduce: OwnerBackwardPrefetchWithPendingReduce = "auto",
         trim_cuda_cache: bool = False,
         cuda_cache_trim_threshold_mb: float = 1024.0,
     ) -> None:
@@ -127,9 +131,12 @@ class MatrixFSDPScheduler:
             raise ValueError("prefetch_policy must be 'static', 'adaptive', or 'profile_guided'.")
         if backward_prefetch_timing not in ("pre_backward", "post_reshard"):
             raise ValueError("backward_prefetch_timing must be 'pre_backward' or 'post_reshard'.")
+        if owner_backward_prefetch_with_pending_reduce not in ("auto", "on", "off"):
+            raise ValueError("owner_backward_prefetch_with_pending_reduce must be 'auto', 'on', or 'off'.")
         self.units = tuple(sorted(units, key=_runtime_param_group_order_key))
         self.prefetch_policy = prefetch_policy
         self.backward_prefetch_timing = backward_prefetch_timing
+        self.owner_backward_prefetch_with_pending_reduce = owner_backward_prefetch_with_pending_reduce
         self.requested_max_unsharded_prefetch_units = max_unsharded_prefetch_units
         self.requested_max_forward_prefetch_units = (
             max_forward_prefetch_units
@@ -462,7 +469,10 @@ class MatrixFSDPScheduler:
             self.backward_prefetch_memory_deferred += 1
             self._record_owner_prefetch_queue_skip(target, "backward", -1, -1, reason="memory_cap")
             return False
-        if self.pending_backward_reduce_count > 0 and not _owner_ordered_backward_prefetch_with_pending_reduce_enabled(target):
+        if (
+            self.pending_backward_reduce_count > 0
+            and not self._owner_ordered_backward_prefetch_with_pending_reduce_enabled(target)
+        ):
             if _owner_ordered_backward_prefetch_wait_pending_reduce_enabled():
                 wait_count = self.pending_backward_reduce_count
                 self._wait_all_pending_backward_reduces()
@@ -1043,6 +1053,15 @@ class MatrixFSDPScheduler:
                 f"lifecycle={lifecycle} post_forward={len(self._post_forward_order)}\n"
             )
 
+    def _owner_ordered_backward_prefetch_with_pending_reduce_enabled(
+        self,
+        target: MatrixFSDPParamGroup | None = None,
+    ) -> bool:
+        return _owner_ordered_backward_prefetch_with_pending_reduce_enabled(
+            target,
+            default=self.owner_backward_prefetch_with_pending_reduce,
+        )
+
     def _debug_owner_prefetch_unit_order(self) -> None:
         if os.environ.get("MATRIX_FSDP_DEBUG_OWNER_PREFETCH_QUEUE", "").lower() not in {"1", "true", "yes", "on"}:
             return
@@ -1118,8 +1137,12 @@ def _scheduler_rank(units: Sequence[MatrixFSDPParamGroup]) -> int:
 
 def _owner_ordered_backward_prefetch_with_pending_reduce_enabled(
     target: MatrixFSDPParamGroup | None = None,
+    *,
+    default: OwnerBackwardPrefetchWithPendingReduce = "auto",
 ) -> bool:
-    value = os.environ.get("MATRIX_FSDP_OWNER_BACKWARD_PREFETCH_WITH_PENDING_REDUCE", "auto").lower()
+    value = os.environ.get("MATRIX_FSDP_OWNER_BACKWARD_PREFETCH_WITH_PENDING_REDUCE")
+    value = default if value is None else value
+    value = value.lower()
     if value in {"1", "true", "yes", "on"}:
         return True
     if value in {"0", "false", "no", "off"}:
@@ -1157,6 +1180,7 @@ def configure_forward_prefetch(
     max_active_full_param_numel: int | None = None,
     max_active_full_param_memory_mb: float | None = None,
     max_pending_backward_reduces: int | None = 1,
+    owner_backward_prefetch_with_pending_reduce: OwnerBackwardPrefetchWithPendingReduce = "auto",
     trim_cuda_cache: bool = False,
     cuda_cache_trim_threshold_mb: float = 1024.0,
 ) -> MatrixFSDPScheduler:
@@ -1173,6 +1197,7 @@ def configure_forward_prefetch(
             max_active_full_param_numel=max_active_full_param_numel,
             max_active_full_param_memory_mb=max_active_full_param_memory_mb,
             max_pending_backward_reduces=max_pending_backward_reduces,
+            owner_backward_prefetch_with_pending_reduce=owner_backward_prefetch_with_pending_reduce,
             trim_cuda_cache=trim_cuda_cache,
             cuda_cache_trim_threshold_mb=cuda_cache_trim_threshold_mb,
         )
@@ -1189,6 +1214,7 @@ def configure_forward_prefetch(
         max_active_full_param_numel=max_active_full_param_numel,
         max_active_full_param_memory_mb=max_active_full_param_memory_mb,
         max_pending_backward_reduces=max_pending_backward_reduces,
+        owner_backward_prefetch_with_pending_reduce=owner_backward_prefetch_with_pending_reduce,
         trim_cuda_cache=trim_cuda_cache,
         cuda_cache_trim_threshold_mb=cuda_cache_trim_threshold_mb,
     )

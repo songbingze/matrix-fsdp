@@ -400,6 +400,7 @@ def _prepare_matrix_owner_muon(
     owner_assignment = "role_greedy" if "role_greedy" in config.mode else "rotate"
     matrix_collective_backend = "custom" if "custom_collective" in config.mode else "owner_broadcast"
     use_zero_copy_grad_bucket = config.mode.endswith("_zero_copy_grad_bucket")
+    owner_backward_prefetch_with_pending_reduce = "on" if matrix_collective_backend == "custom" else "auto"
     sharded_model = matrix_fully_shard(
         model,
         mesh,
@@ -422,6 +423,7 @@ def _prepare_matrix_owner_muon(
         max_active_full_param_buffers=config.max_active_full_param_buffers,
         max_active_full_param_numel=config.max_active_full_param_numel,
         max_active_full_param_memory_mb=config.max_active_full_param_memory_mb or None,
+        owner_backward_prefetch_with_pending_reduce=owner_backward_prefetch_with_pending_reduce,
     )
     return sharded_model, optimizer
 

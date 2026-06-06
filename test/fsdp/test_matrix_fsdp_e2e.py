@@ -3005,6 +3005,23 @@ class MatrixFSDPE2ETest(unittest.TestCase):
         self.assertEqual(scheduler.backward_prefetch_memory_deferred, 0)
 
         units = [FakeUnit(index) for index in range(3)]
+        scheduler = MatrixFSDPScheduler(
+            units,
+            max_unsharded_prefetch_units=1,
+            owner_backward_prefetch_with_pending_reduce="on",
+        )
+        for unit in units:
+            scheduler.record_post_forward(unit)
+        units[2].has_pending_backward_reduce = True
+        scheduler._pending_backward_reduce_units.append(units[2])
+
+        scheduler.on_pre_backward(units[2])
+
+        self.assertIn("backward_prefetch", units[1].events)
+        self.assertEqual(scheduler.backward_prefetch_issued, 1)
+        self.assertEqual(scheduler.backward_prefetch_memory_deferred, 0)
+
+        units = [FakeUnit(index) for index in range(3)]
         scheduler = MatrixFSDPScheduler(units, max_unsharded_prefetch_units=1)
         for unit in units:
             scheduler.record_post_forward(unit)

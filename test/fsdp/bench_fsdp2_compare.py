@@ -2567,9 +2567,12 @@ def _prepare_matrix_owner_muon(
     max_backward_prefetch_units: int | None = None,
     max_active_full_param_buffers: int | None = None,
     max_pending_backward_reduces: int | None = 1,
+    owner_backward_prefetch_with_pending_reduce: str = "auto",
 ) -> tuple[nn.Module, MatrixFSDPOptimizer]:
     if config.optimizer != "muon":
         raise ValueError("matrix_owner_muon modes require --optimizer muon.")
+    if owner_backward_prefetch_with_pending_reduce == "auto" and matrix_collective_backend == "custom":
+        owner_backward_prefetch_with_pending_reduce = "on"
 
     group_planner = (
         None
@@ -2604,6 +2607,7 @@ def _prepare_matrix_owner_muon(
         backward_prefetch_timing=backward_prefetch_timing,  # type: ignore[arg-type]
         max_active_full_param_buffers=max_active_full_param_buffers,
         max_pending_backward_reduces=max_pending_backward_reduces,
+        owner_backward_prefetch_with_pending_reduce=owner_backward_prefetch_with_pending_reduce,  # type: ignore[arg-type]
         max_cached_elastic_workspaces_per_key=config.matrix_max_cached_elastic_workspaces_per_key,
     )
     return sharded_model, optimizer
